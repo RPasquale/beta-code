@@ -1,0 +1,61 @@
+# Safe SFT config for RTX 4090 (24GB)
+# Designed to use max 20GB VRAM with 4GB safety buffer
+
+model_name: "Qwen/Qwen2.5-Coder-3B"  # Start with 3B, can upgrade to 7B later
+
+# QLoRA 4-bit quantization (memory efficient)
+load_in_4bit: true
+bnb_4bit_quant_type: "nf4"
+bnb_4bit_use_double_quant: true
+bnb_4bit_compute_dtype: "bfloat16"
+
+# LoRA configuration (conservative for stability)
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+# Memory optimization
+gradient_checkpointing: true
+bf16: true
+dataloader_pin_memory: false  # Reduce memory pressure
+dataloader_num_workers: 2     # Conservative worker count
+
+# Sequence length (start conservative, can increase if stable)
+max_seq_len: 1536  # Start with 1536, can go to 2048 if stable
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16  # Effective batch size = 16
+
+# Training hyperparameters (conservative for stability)
+learning_rate: 1.5e-4
+weight_decay: 0.0
+warmup_ratio: 0.03
+num_train_epochs: 2
+max_grad_norm: 1.0  # Gradient clipping for stability
+
+# Logging and saving (frequent saves for crash recovery)
+logging_steps: 10
+save_steps: 200
+eval_steps: 500
+save_total_limit: 3  # Keep only 3 checkpoints to save disk space
+
+# Safety features
+remove_unused_columns: true
+group_by_length: true  # More efficient batching
+packing: true          # Pack sequences for efficiency
+
+# Output
+output_dir: "outputs/sft_diff_qwen3b_safe"
+logging_dir: "logs/sft_diff_qwen3b_safe"
+report_to: "wandb"  # Optional: comment out if you don't want wandb
+
+# Dataset
+train_file: "data/processed/diffs.jsonl"
+validation_file: "data/processed/diffs_val.jsonl"
+max_train_samples: 10000  # Limit for initial training
+max_eval_samples: 1000
+
+# Safety overrides (will be set by training script)
+max_memory_usage: 0.85  # Use max 85% of available VRAM
+auto_batch_size: true   # Automatically reduce batch size if OOM
+crash_recovery: true    # Enable crash recovery

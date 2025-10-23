@@ -298,3 +298,16 @@ test_results/
 # Documentation builds
 docs/_build/
 site/
+*.json
+*.jsonl
+*.parquet
+*.arrow
+*.feather
+*.xlsx
+*.xls
+*.csv
+*.txt
+*.log
+*.err
+*.out
+*.err.log
