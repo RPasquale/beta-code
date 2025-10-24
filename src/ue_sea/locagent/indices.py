@@ -9,8 +9,21 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Set, Tuple, Any
 import numpy as np
 from rank_bm25 import BM25Okapi
-import faiss
-import cupy as cp  # GPU acceleration for RTX 4090
+
+# Optional imports for GPU acceleration
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except ImportError:
+    FAISS_AVAILABLE = False
+    faiss = None
+
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+except ImportError:
+    CUPY_AVAILABLE = False
+    cp = None
 
 from .entities import Entity, EntityType
 
@@ -260,12 +273,12 @@ class BM25Index(SparseIndex):
         self._bm25 = BM25Okapi(tokenized_corpus)
         
         # Build FAISS index for GPU acceleration if enabled
-        if self.use_gpu and len(self._corpus) > 100:
+        if self.use_gpu and len(self._corpus) > 100 and FAISS_AVAILABLE:
             self._build_faiss_index()
     
     def _build_faiss_index(self) -> None:
         """Build FAISS index for GPU-accelerated similarity search."""
-        if not self._bm25:
+        if not self._bm25 or not FAISS_AVAILABLE:
             return
         
         # Get document embeddings using BM25
@@ -279,7 +292,7 @@ class BM25Index(SparseIndex):
         
         # Create FAISS index
         dimension = self._embeddings.shape[1]
-        if self.use_gpu and cp.cuda.is_available():
+        if self.use_gpu and CUPY_AVAILABLE and cp.cuda.is_available():
             # Use GPU for FAISS
             self._faiss_index = faiss.IndexFlatIP(dimension)
             self._faiss_index = faiss.index_cpu_to_gpu(
@@ -294,7 +307,7 @@ class BM25Index(SparseIndex):
     
     def search_with_faiss(self, query: str, limit: int = 10) -> List[Tuple[str, float]]:
         """Search using FAISS index for GPU acceleration."""
-        if not self._faiss_index or not self._embeddings is not None:
+        if self._faiss_index is None or self._embeddings is None:
             return self.search(query, limit)
         
         # Get query embedding
@@ -361,7 +374,7 @@ class HierarchicalIndex:
             all_results.extend(name_results)
         
         if "content" in search_types:
-            if self.use_gpu and self.bm25_index._faiss_index is not None:
+            if self.use_gpu and FAISS_AVAILABLE and self.bm25_index._faiss_index is not None:
                 content_results = self.bm25_index.search_with_faiss(query, limit)
             else:
                 content_results = self.bm25_index.search(query, limit)

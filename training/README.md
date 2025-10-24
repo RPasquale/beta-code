@@ -43,8 +43,8 @@ python scripts/download_datasets.py --data_dir data
 python start_monitoring.py --mode training
 
 # Option 2: Manual training (with 10% validation holdout)
-python train.py --output-dir outputs/unified_training --validation-ratio 0.1
-```
+python train.py --output-dir outputs/unified_training --validation-ratio 0.1 --stage rft
+To focus on particular objectives (e.g., AlphaCode + RL), append `--objectives alpha_code rl`.
 The run writes training metrics to `outputs/unified_training/training_metrics.jsonl`,
 validation results to `outputs/unified_training/eval_results.json`, and streams both
 to Weights & Biases when `WANDB_MODE` is enabled.
@@ -205,6 +205,7 @@ training/
 
 - Control the held-out split per objective with `--validation-ratio` (default `0.1`).
 - Limit validation workload via `--eval-max-samples-per-objective` when running smoke tests.
+- Select training stage with `--stage rft` (rejective fine-tuning) or `--stage rl` (KL-regularised rule-based RL). Use `--kl-beta`, `--reward-clip`, and `--entropy-floor` to tune RL behaviour, and trim to specific objectives with `--objectives` (defaults to all).
 - After training finishes, metrics are written to `outputs/<run>/eval_results.json` and logged to Weights & Biases (`eval_loss`, `eval_perplexity`, runtime stats).
 - Set `--validation-ratio 0` to disable validation entirely when you only want to train.
 

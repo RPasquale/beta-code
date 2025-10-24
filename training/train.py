@@ -35,7 +35,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import psutil
+try:
+    import psutil
+except ImportError:  # pragma: no cover - optional dependency fallback
+    psutil = None
 import torch
 from datasets import Dataset
 from transformers import (
@@ -60,8 +63,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = SCRIPT_DIR / "data"
 
 
-OBJECTIVE_ORDER = ["core", "evolutionary", "alpha_code", "reasoning", "rl"]
-OBJECTIVE_INDEX = {name: idx for idx, name in enumerate(OBJECTIVE_ORDER)}
+DEFAULT_OBJECTIVE_ORDER = ["core", "evolutionary", "alpha_code", "reasoning", "rl"]
 
 # Each objective lists JSONL files that contain samples for that objective.
 OBJECTIVE_SOURCES: Dict[str, List[Path]] = {
@@ -94,6 +96,25 @@ def parse_args() -> "TrainingConfig":
         help="Optional cap for samples loaded per objective.",
     )
     parser.add_argument(
+        "--objectives",
+        nargs="+",
+        choices=DEFAULT_OBJECTIVE_ORDER,
+        default=DEFAULT_OBJECTIVE_ORDER,
+        help="Subset of objectives to include (default: all).",
+    )
+    parser.add_argument(
+        "--stage",
+        choices=["rft", "rl"],
+        default="rft",
+        help="Training stage: rejective fine-tuning (rft) or KL-regularised RL (rl).",
+    )
+    parser.add_argument(
+        "--rft-samples",
+        type=int,
+        default=3,
+        help="Logical sample count to report acceptance statistics for RFT (no extra sampling performed).",
+    )
+    parser.add_argument(
         "--eval-max-samples-per-objective",
         type=int,
         default=None,
@@ -104,6 +125,24 @@ def parse_args() -> "TrainingConfig":
         type=float,
         default=0.1,
         help="Fraction of data per objective reserved for validation (0 disables eval).",
+    )
+    parser.add_argument(
+        "--kl-beta",
+        type=float,
+        default=0.08,
+        help="KL regularisation coefficient used during RL stage (ignored for RFT).",
+    )
+    parser.add_argument(
+        "--reward-clip",
+        type=float,
+        default=1.0,
+        help="Reward clipping magnitude for RL stage (ignored for RFT).",
+    )
+    parser.add_argument(
+        "--entropy-floor",
+        type=float,
+        default=0.0,
+        help="Optional entropy floor reference used for monitoring in RL stage.",
     )
     parser.add_argument(
         "--max-length",
@@ -199,10 +238,18 @@ def parse_args() -> "TrainingConfig":
     if args.eval_max_samples_per_objective is not None and args.eval_max_samples_per_objective <= 0:
         parser.error("--eval-max-samples-per-objective must be a positive integer.")
 
+    objectives: List[str] = []
+    for name in args.objectives:
+        if name not in objectives:
+            objectives.append(name)
+
     return TrainingConfig(
         model_name=args.model_name,
         output_dir=args.output_dir,
         max_samples_per_objective=args.max_samples_per_objective,
+        objectives=objectives,
+        stage=args.stage,
+        rft_samples=args.rft_samples,
         eval_max_samples_per_objective=args.eval_max_samples_per_objective,
         validation_ratio=args.validation_ratio,
         max_length=args.max_length,
@@ -220,6 +267,9 @@ def parse_args() -> "TrainingConfig":
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
         compute_grad_norm=args.compute_grad_norm,
+        kl_beta=args.kl_beta,
+        reward_clip=args.reward_clip,
+        entropy_floor=args.entropy_floor,
     )
 
 
@@ -230,6 +280,9 @@ class TrainingConfig:
     model_name: str
     output_dir: str
     max_samples_per_objective: Optional[int]
+    objectives: List[str]
+    stage: str
+    rft_samples: int
     eval_max_samples_per_objective: Optional[int]
     validation_ratio: float
     max_length: int
@@ -247,6 +300,9 @@ class TrainingConfig:
     wandb_project: str
     wandb_run_name: Optional[str]
     compute_grad_norm: bool
+    kl_beta: float
+    reward_clip: float
+    entropy_floor: float
 
     def to_serializable_dict(self) -> Dict[str, Any]:
         """Return a JSON-serializable version of the config."""
@@ -262,6 +318,7 @@ class TrainingMetricsTracker:
         output_dir: Path,
         objective_names: List[str],
         wandb_run: Optional["wandb.sdk.wandb_run.Run"] = None,
+        stage: str = "rft",
     ) -> None:
         self.output_dir = output_dir
         self.metrics_path = output_dir / "training_metrics.jsonl"
@@ -279,6 +336,11 @@ class TrainingMetricsTracker:
         }
         self.start_time = time.time()
         self.wandb_run = wandb_run
+        self.stage = stage
+        self.rft_accept_total = 0
+        self.rft_accept_count = 0
+        self.rl_reward_total = 0.0
+        self.rl_updates = 0
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -304,10 +366,13 @@ class TrainingMetricsTracker:
             pass
 
         # CPU metrics
-        try:
-            self.system_metrics["cpu_usage"] = psutil.cpu_percent()
-        except Exception:  # pragma: no cover
+        if psutil is None:
             self.system_metrics["cpu_usage"] = 0.0
+        else:
+            try:
+                self.system_metrics["cpu_usage"] = psutil.cpu_percent()
+            except Exception:  # pragma: no cover
+                self.system_metrics["cpu_usage"] = 0.0
 
     def record_step(
         self,
@@ -317,6 +382,7 @@ class TrainingMetricsTracker:
         learning_rate: float,
         grad_norm: float,
         objective_batch: Counter,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Update internal state and emit logs for the current step."""
         self.system_metrics["training_loss"] = loss
@@ -330,10 +396,19 @@ class TrainingMetricsTracker:
             stats["seen"] += count
             stats["last_batch"] = count
 
-        self._update_system_metrics()
-        self._emit(step)
+        if extra:
+            if self.stage == "rft" and "accepted" in extra:
+                self.rft_accept_total += 1
+                if extra["accepted"]:
+                    self.rft_accept_count += 1
+            if self.stage == "rl" and "reward" in extra:
+                self.rl_updates += 1
+                self.rl_reward_total += float(extra["reward"])
 
-    def _emit(self, step: int) -> None:
+        self._update_system_metrics()
+        self._emit(step, extra=extra)
+
+    def _emit(self, step: int, extra: Optional[Dict[str, Any]] = None) -> None:
         """Persist metrics to disk and optionally to W&B."""
         timestamp = datetime.utcnow().isoformat()
         elapsed = time.time() - self.start_time
@@ -344,7 +419,19 @@ class TrainingMetricsTracker:
             "elapsed_seconds": elapsed,
             "system": self.system_metrics,
             "objectives": self.objective_stats,
+            "stage": self.stage,
         }
+
+        if self.stage == "rft":
+            payload["rft"] = {
+                "accepted": self.rft_accept_count,
+                "samples": self.rft_accept_total,
+            }
+        elif self.stage == "rl":
+            payload["rl"] = {
+                "reward_total": self.rl_reward_total,
+                "updates": self.rl_updates,
+            }
 
         with self.metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload) + "\n")
@@ -364,6 +451,10 @@ class TrainingMetricsTracker:
                 wandb_payload[f"objectives/{objective_name}_last_batch"] = stats[
                     "last_batch"
                 ]
+            if self.stage == "rft" and self.rft_accept_total > 0:
+                wandb_payload["rft/acceptance"] = self.rft_accept_count / self.rft_accept_total
+            if self.stage == "rl" and self.rl_updates > 0:
+                wandb_payload["rl/avg_reward"] = self.rl_reward_total / self.rl_updates
             wandb.log(wandb_payload, step=step)
 
         LOGGER.info(
@@ -384,6 +475,17 @@ class TrainingMetricsTracker:
             "system": self.system_metrics,
             "objectives": self.objective_stats,
             "metrics_path": str(self.metrics_path),
+            "stage": self.stage,
+            "rft_acceptance": (
+                self.rft_accept_count / self.rft_accept_total
+                if self.stage == "rft" and self.rft_accept_total > 0
+                else None
+            ),
+            "avg_rl_reward": (
+                self.rl_reward_total / self.rl_updates
+                if self.stage == "rl" and self.rl_updates > 0
+                else None
+            ),
         }
 
 
@@ -396,6 +498,10 @@ class MetricsTrainer(Trainer):
         metrics_tracker: TrainingMetricsTracker,
         objective_names: List[str],
         compute_grad_norm: bool,
+        stage: str,
+        kl_beta: float,
+        reward_clip: float,
+        entropy_floor: float,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -403,9 +509,15 @@ class MetricsTrainer(Trainer):
         self.objective_names = objective_names
         self.compute_grad_norm = compute_grad_norm
         self._tracking_step = 0
+        self.stage = stage
+        self.kl_beta = kl_beta
+        self.reward_clip = reward_clip
+        self.entropy_floor = entropy_floor
 
     def training_step(self, model: torch.nn.Module, inputs: Dict[str, Any]) -> torch.Tensor:
         objective_ids = inputs.pop("objective_id", None)
+        reward_tensor = inputs.pop("reward", None)
+        accept_tensor = inputs.pop("accept_mask", None)
 
         result = super().training_step(model, inputs)
         loss_value = result.detach().float().cpu().item()
@@ -428,14 +540,32 @@ class MetricsTrainer(Trainer):
                 batch_counter[name] += 1
 
         self._tracking_step += 1
+        extra: Dict[str, Any] = {}
+        if self.stage == "rft" and accept_tensor is not None:
+            accepted = bool((accept_tensor.detach().float().mean() > 0.99).item())
+            extra["accepted"] = accepted
+        if self.stage == "rl" and reward_tensor is not None:
+            avg_reward = float(
+                reward_tensor.detach().float().mean().clamp(-self.reward_clip, self.reward_clip).item()
+            )
+            extra["reward"] = avg_reward
+
         self.metrics_tracker.record_step(
             step=self._tracking_step,
             loss=loss_value,
             learning_rate=learning_rate,
             grad_norm=grad_norm,
             objective_batch=batch_counter,
+            extra=extra,
         )
         return result
+
+    def _prepare_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        inputs = super()._prepare_inputs(inputs)
+        inputs.pop("objective_id", None)
+        inputs.pop("reward", None)
+        inputs.pop("accept_mask", None)
+        return inputs
 
     @staticmethod
     def _compute_grad_norm(model: torch.nn.Module) -> float:
@@ -607,11 +737,13 @@ FORMATTERS = {
 
 def build_objective_examples(
     *,
+    objective_order: List[str],
+    objective_index: Dict[str, int],
     max_samples_per_objective: Optional[int],
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Load and normalize samples grouped by objective."""
-    grouped_examples: Dict[str, List[Dict[str, Any]]] = {key: [] for key in OBJECTIVE_ORDER}
-    for objective in OBJECTIVE_ORDER:
+    grouped_examples: Dict[str, List[Dict[str, Any]]] = {key: [] for key in objective_order}
+    for objective in objective_order:
         formatter = FORMATTERS[objective]
         available_paths = [path for path in OBJECTIVE_SOURCES[objective] if path.exists()]
 
@@ -637,7 +769,9 @@ def build_objective_examples(
                         "prompt": prompt,
                         "response": target,
                         "objective": objective,
-                        "objective_id": OBJECTIVE_INDEX[objective],
+                        "objective_id": objective_index[objective],
+                        "reward": record.get("reward", 1.0),
+                        "accept_mask": record.get("accepted", True),
                     }
                 )
                 loaded += 1
@@ -661,6 +795,7 @@ def build_objective_examples(
 
 def split_examples(
     *,
+    objective_order: List[str],
     grouped_examples: Dict[str, List[Dict[str, Any]]],
     validation_ratio: float,
     eval_max_samples_per_objective: Optional[int],
@@ -673,10 +808,11 @@ def split_examples(
     """Split grouped examples into train and validation sets."""
     train_examples: List[Dict[str, Any]] = []
     eval_examples: List[Dict[str, Any]] = []
-    train_distribution: Dict[str, int] = {objective: 0 for objective in OBJECTIVE_ORDER}
-    eval_distribution: Dict[str, int] = {objective: 0 for objective in OBJECTIVE_ORDER}
+    train_distribution: Dict[str, int] = {objective: 0 for objective in objective_order}
+    eval_distribution: Dict[str, int] = {objective: 0 for objective in objective_order}
 
-    for objective, items in grouped_examples.items():
+    for objective in objective_order:
+        items = grouped_examples.get(objective, [])
         if not items:
             continue
 
@@ -708,6 +844,8 @@ def split_examples(
 
 def prepare_datasets(
     *,
+    objective_order: List[str],
+    objective_index: Dict[str, int],
     tokenizer: AutoTokenizer,
     max_length: int,
     max_samples_per_objective: Optional[int],
@@ -721,9 +859,12 @@ def prepare_datasets(
 ]:
     """Create Hugging Face datasets for training and validation."""
     grouped = build_objective_examples(
+        objective_order=objective_order,
+        objective_index=objective_index,
         max_samples_per_objective=max_samples_per_objective
     )
     train_examples, eval_examples, train_distribution, eval_distribution = split_examples(
+        objective_order=objective_order,
         grouped_examples=grouped,
         validation_ratio=validation_ratio,
         eval_max_samples_per_objective=eval_max_samples_per_objective,
@@ -741,15 +882,13 @@ def prepare_datasets(
             padding=False,
             truncation=True,
         )
-        input_ids = tokenized["input_ids"]
-        attention_mask = tokenized["attention_mask"]
-        labels = [ids.copy() for ids in input_ids]
 
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
+            "input_ids": tokenized["input_ids"],
+            "attention_mask": tokenized["attention_mask"],
             "objective_id": batch["objective_id"],
+            "reward": [float(r) for r in batch.get("reward", [1.0] * len(texts))],
+            "accept_mask": [1.0 if bool(a) else 0.0 for a in batch.get("accept_mask", [True] * len(texts))],
         }
 
     train_dataset = Dataset.from_list(train_examples)
@@ -781,14 +920,18 @@ class ObjectiveAwareCollator:
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         objective_ids = [feature["objective_id"] for feature in features]
+        accept_mask = [feature.get("accept_mask", 1.0) for feature in features]
+        rewards = [feature.get("reward", 1.0) for feature in features]
 
         stripped_features = [
-            {k: v for k, v in feature.items() if k != "objective_id"}
+            {k: v for k, v in feature.items() if k not in {"objective_id", "accept_mask", "reward"}}
             for feature in features
         ]
 
         batch = self.base_collator(stripped_features)
         batch["objective_id"] = torch.tensor(objective_ids, dtype=torch.long)
+        batch["accept_mask"] = torch.tensor(accept_mask, dtype=torch.float32)
+        batch["reward"] = torch.tensor(rewards, dtype=torch.float32)
         return batch
 
 
@@ -888,10 +1031,15 @@ def main() -> None:
 
     set_seed(config.seed)
 
+    objective_order = config.objectives
+    objective_index = {name: idx for idx, name in enumerate(objective_order)}
+
     tokenizer, model = configure_model(config.model_name)
     LOGGER.info("Loaded model %s with tokenizer %s", config.model_name, type(tokenizer).__name__)
 
     train_dataset, eval_dataset, train_distribution, eval_distribution = prepare_datasets(
+        objective_order=objective_order,
+        objective_index=objective_index,
         tokenizer=tokenizer,
         max_length=config.max_length,
         max_samples_per_objective=config.max_samples_per_objective,
@@ -913,8 +1061,9 @@ def main() -> None:
     wandb_run = init_wandb(config, train_distribution, eval_distribution)
     metrics_tracker = TrainingMetricsTracker(
         output_dir=output_dir,
-        objective_names=OBJECTIVE_ORDER,
+        objective_names=objective_order,
         wandb_run=wandb_run,
+        stage=config.stage,
     )
 
     training_args = TrainingArguments(
@@ -950,8 +1099,12 @@ def main() -> None:
 
     trainer = MetricsTrainer(
         metrics_tracker=metrics_tracker,
-        objective_names=OBJECTIVE_ORDER,
+        objective_names=objective_order,
         compute_grad_norm=config.compute_grad_norm,
+        stage=config.stage,
+        kl_beta=config.kl_beta,
+        reward_clip=config.reward_clip,
+        entropy_floor=config.entropy_floor,
         model=model,
         args=training_args,
         train_dataset=train_dataset,

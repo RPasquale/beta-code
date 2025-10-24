@@ -57,6 +57,149 @@ def download_swe_bench_lite(data_dir: Path) -> None:
         logger.error(f"Error downloading SWE-bench Lite: {e}")
 
 
+def download_mbpp(data_dir: Path) -> None:
+    """Download MBPP dataset."""
+    logger.info("Downloading MBPP dataset...")
+    
+    try:
+        dataset = load_dataset("mbpp", split="train")
+        logger.info(f"Downloaded {len(dataset)} samples from MBPP")
+        
+        # Save to local directory
+        dataset.save_to_disk(data_dir / "raw" / "mbpp")
+        
+        # Process into unified format
+        processed_data = []
+        for item in dataset:
+            processed_item = {
+                "task_id": f"mbpp_{item.get('task_id', '')}",
+                "language": item.get("language", "python"),
+                "prompt": item.get("text", ""),
+                "candidates": [
+                    {
+                        "code": item.get("code", ""),
+                        "exec_pass": True,  # MBPP items are verified
+                        "stderr": "",
+                        "tests_passed": 1,
+                        "tests_total": 1,
+                    }
+                ],
+                "gold_best_index": 0,
+                "label": 1,
+                "meta": {"source": "MBPP"},
+                "reward": 1.0,
+                "accepted": True,
+            }
+            processed_data.append(processed_item)
+        
+        # Save processed data
+        output_file = data_dir / "processed" / "mbpp.jsonl"
+        with open(output_file, 'w') as f:
+            for item in processed_data:
+                f.write(json.dumps(item) + '\n')
+        
+        logger.info(f"Processed {len(processed_data)} MBPP samples to {output_file}")
+        
+    except Exception as e:
+        logger.error(f"Error downloading MBPP: {e}")
+
+
+def download_apps(data_dir: Path) -> None:
+    """Download APPS dataset."""
+    logger.info("Downloading APPS dataset...")
+    
+    try:
+        dataset = load_dataset("codeparrot/apps", split="train")
+        logger.info(f"Downloaded {len(dataset)} samples from APPS")
+        
+        # Save to local directory
+        dataset.save_to_disk(data_dir / "raw" / "apps")
+        
+        # Process into unified format
+        processed_data = []
+        for item in dataset:
+            processed_item = {
+                "task_id": f"apps_{item.get('problem_id', '')}",
+                "language": "python",
+                "prompt": item.get("question", ""),
+                "candidates": [
+                    {
+                        "code": solution,
+                        "exec_pass": False,  # Will be determined by execution
+                        "stderr": "",
+                        "tests_passed": 0,
+                        "tests_total": len(item.get("input_output", {}).get("inputs", [])),
+                    }
+                    for solution in item.get("solutions", [])
+                ],
+                "gold_best_index": 0,
+                "label": None,
+                "meta": {"source": "APPS", "difficulty": item.get("difficulty", "unknown")},
+                "reward": 1.0,
+                "accepted": False,
+            }
+            processed_data.append(processed_item)
+        
+        # Save processed data
+        output_file = data_dir / "processed" / "apps.jsonl"
+        with open(output_file, 'w') as f:
+            for item in processed_data:
+                f.write(json.dumps(item) + '\n')
+        
+        logger.info(f"Processed {len(processed_data)} APPS samples to {output_file}")
+        
+    except Exception as e:
+        logger.error(f"Error downloading APPS: {e}")
+
+
+def download_code_contests(data_dir: Path) -> None:
+    """Download CodeContests dataset."""
+    logger.info("Downloading CodeContests dataset...")
+    
+    try:
+        dataset = load_dataset("deepmind/code_contests", split="train")
+        logger.info(f"Downloaded {len(dataset)} samples from CodeContests")
+        
+        # Save to local directory
+        dataset.save_to_disk(data_dir / "raw" / "code_contests")
+        
+        # Process into unified format
+        processed_data = []
+        for item in dataset:
+            processed_item = {
+                "task_id": f"codecontests_{item.get('name', '')}",
+                "language": "python",
+                "prompt": item.get("description", ""),
+                "candidates": [
+                    {
+                        "code": solution,
+                        "exec_pass": False,
+                        "stderr": "",
+                        "tests_passed": 0,
+                        "tests_total": len(item.get("public_tests", {}).get("input", [])),
+                    }
+                    for solution in item.get("solutions", [])
+                ],
+                "gold_best_index": 0,
+                "label": None,
+                "meta": {"source": "CodeContests"},
+                "reward": 1.0,
+                "accepted": False,
+            }
+            processed_data.append(processed_item)
+        
+        # Save processed data
+        output_file = data_dir / "processed" / "code_contests.jsonl"
+        with open(output_file, 'w') as f:
+            for item in processed_data:
+                f.write(json.dumps(item) + '\n')
+        
+        logger.info(f"Processed {len(processed_data)} CodeContests samples to {output_file}")
+        
+    except Exception as e:
+        logger.error(f"Error downloading CodeContests: {e}")
+
+
 def download_competition_math(data_dir: Path) -> None:
     """Download Competition Math dataset."""
     logger.info("Downloading Competition Math dataset...")
@@ -236,7 +379,7 @@ def main():
     parser = argparse.ArgumentParser(description="Download datasets for UE-SEA training")
     parser.add_argument("--data_dir", type=str, default="data", help="Data directory")
     parser.add_argument("--datasets", nargs="+", default=["all"], 
-                       choices=["all", "swe_bench", "math", "tools", "tests", "rl"],
+                       choices=["all", "swe_bench", "mbpp", "apps", "code_contests", "math", "tools", "tests", "rl"],
                        help="Datasets to download")
     
     args = parser.parse_args()
@@ -250,6 +393,15 @@ def main():
     
     if "all" in args.datasets or "swe_bench" in args.datasets:
         download_swe_bench_lite(data_dir)
+    
+    if "all" in args.datasets or "mbpp" in args.datasets:
+        download_mbpp(data_dir)
+    
+    if "all" in args.datasets or "apps" in args.datasets:
+        download_apps(data_dir)
+    
+    if "all" in args.datasets or "code_contests" in args.datasets:
+        download_code_contests(data_dir)
     
     if "all" in args.datasets or "math" in args.datasets:
         download_competition_math(data_dir)

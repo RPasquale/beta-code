@@ -46,29 +46,49 @@ class LOCAGENT_Graph:
         parsers = {}
         
         try:
-            # Try to load tree-sitter languages
-            import tree_sitter_python
-            import tree_sitter_javascript
-            import tree_sitter_typescript
-            
             from tree_sitter import Language
             
-            # Build language objects
-            python_lang = Language(tree_sitter_python.language())
-            js_lang = Language(tree_sitter_javascript.language())
-            ts_lang = Language(tree_sitter_typescript.language())
+            # Try to build language libraries
+            import tempfile
+            import os
             
-            from .parser import PythonParser, JavaScriptParser, TypeScriptParser
+            # Create temporary directory for compiled languages
+            temp_dir = tempfile.mkdtemp()
             
-            parsers = {
-                '.py': PythonParser(python_lang),
-                '.js': JavaScriptParser(js_lang),
-                '.ts': TypeScriptParser(ts_lang),
-                '.tsx': TypeScriptParser(ts_lang),
-            }
+            # Build Python language
+            try:
+                python_lib = os.path.join(temp_dir, "python.so")
+                Language.build_library(python_lib, ["tree-sitter-python"])
+                python_lang = Language(python_lib, "python")
+                from .parser import PythonParser
+                parsers['.py'] = PythonParser(python_lang)
+            except Exception as e:
+                print(f"Warning: Could not build Python parser: {e}")
+            
+            # Build JavaScript language
+            try:
+                js_lib = os.path.join(temp_dir, "javascript.so")
+                Language.build_library(js_lib, ["tree-sitter-javascript"])
+                js_lang = Language(js_lib, "javascript")
+                from .parser import JavaScriptParser
+                parsers['.js'] = JavaScriptParser(js_lang)
+            except Exception as e:
+                print(f"Warning: Could not build JavaScript parser: {e}")
+            
+            # Build TypeScript language
+            try:
+                ts_lib = os.path.join(temp_dir, "typescript.so")
+                Language.build_library(ts_lib, ["tree-sitter-typescript", "tree-sitter-typescript"])
+                ts_lang = Language(ts_lib, "typescript")
+                from .parser import TypeScriptParser
+                parsers['.ts'] = TypeScriptParser(ts_lang)
+                parsers['.tsx'] = TypeScriptParser(ts_lang)
+            except Exception as e:
+                print(f"Warning: Could not build TypeScript parser: {e}")
+                
         except ImportError as e:
-            print(f"Warning: Could not initialize tree-sitter parsers: {e}")
-            print("Some language support may be limited.")
+            print(f"Warning: Could not initialize tree-sitter: {e}")
+            print("Falling back to basic parsing without AST support.")
         
         return parsers
     
@@ -235,7 +255,7 @@ class LOCAGENT_Graph:
             "entity_types": entity_types,
             "relation_types": relation_types,
             "graph_density": nx.density(self._graph),
-            "connected_components": nx.number_weakly_connected_components(self._graph),
+            "connected_components": nx.number_weakly_connected_components(self._graph.to_undirected()),
         }
     
     def save_to_file(self, file_path: str) -> None:

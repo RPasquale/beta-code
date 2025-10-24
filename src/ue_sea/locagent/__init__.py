@@ -10,6 +10,9 @@ from .entities import Entity, EntityType, Relation, RelationType
 from .indices import SparseIndex, IDIndex, NameIndex, BM25Index
 from .tools import SearchEntity, TraverseGraph, RetrieveEntity
 from .parser import CodeParser, PythonParser, JavaScriptParser, TypeScriptParser
+from .agent import LOCAGENT_Agent, AgentAction, AgentObservation, LocalizationResult
+from .training import LOCAGENT_Trainer, TrajectoryGenerator, LocalizationExample, AgentTrajectory
+from .github_integration import GitHubRepository, GitHubConfig, github_train
 
 __all__ = [
     "LOCAGENT_Graph",
@@ -28,4 +31,15 @@ __all__ = [
     "PythonParser",
     "JavaScriptParser",
     "TypeScriptParser",
+    "LOCAGENT_Agent",
+    "AgentAction",
+    "AgentObservation", 
+    "LocalizationResult",
+    "LOCAGENT_Trainer",
+    "TrajectoryGenerator",
+    "LocalizationExample",
+    "AgentTrajectory",
+    "GitHubRepository",
+    "GitHubConfig",
+    "github_train",
 ]

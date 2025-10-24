@@ -1,0 +1,3 @@
+"""
+LOCAGENT test package.
+"""
