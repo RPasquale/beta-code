@@ -6,7 +6,7 @@ with SFT→RL curriculum and temperature-entropy targeting.
 """
 
 from .skill_path import SkillPath, SkillType, SkillConfig
-from .curriculum import ReasoningCurriculum, SFTStage, RLStage
+from .curriculum import ReasoningCurriculum, TrainingStage
 from .localizer import BugLocalizer
 from .verifier import CodeVerifier
 from .refactorer import CodeRefactorer
@@ -18,8 +18,7 @@ __all__ = [
     "SkillType",
     "SkillConfig",
     "ReasoningCurriculum",
-    "SFTStage",
-    "RLStage",
+    "TrainingStage",
     "BugLocalizer",
     "CodeVerifier", 
     "CodeRefactorer",

@@ -7,7 +7,16 @@ searching, traversing, and retrieving code entities.
 
 from .graph import LOCAGENT_Graph
 from .entities import Entity, EntityType, Relation, RelationType
-from .indices import SparseIndex, IDIndex, NameIndex, BM25Index
+from .indices import (
+    SparseIndex,
+    IDIndex,
+    NameIndex,
+    BM25Index,
+    DenseIndex,
+    HierarchicalIndex,
+)
+from .gpu_enhanced_indices import GPUEnhancedBM25Index, GPUEnhancedHierarchicalIndex
+from .graph import HybridSearchResult
 from .tools import SearchEntity, TraverseGraph, RetrieveEntity
 from .parser import CodeParser, PythonParser, JavaScriptParser, TypeScriptParser
 from .agent import LOCAGENT_Agent, AgentAction, AgentObservation, LocalizationResult
@@ -24,6 +33,11 @@ __all__ = [
     "IDIndex",
     "NameIndex", 
     "BM25Index",
+    "DenseIndex",
+    "HierarchicalIndex",
+    "GPUEnhancedBM25Index",
+    "GPUEnhancedHierarchicalIndex",
+    "HybridSearchResult",
     "SearchEntity",
     "TraverseGraph",
     "RetrieveEntity",

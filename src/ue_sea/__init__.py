@@ -12,7 +12,6 @@ from .orchestrator import UE_SEA_Orchestrator
 from .locagent import LOCAGENT_Graph, SearchEntity, TraverseGraph, RetrieveEntity
 from .alphaevolve import AlphaEvolve_Controller
 from .reasoning import SkillPath, ReasoningCurriculum
-from .distributed import StreamingDiLoCo, DiPaCo_Router
 from .optimizer import EvolutionStrategies
 from .evaluation import EvaluatorPool, GuardrailSystem
 
@@ -25,8 +24,6 @@ __all__ = [
     "AlphaEvolve_Controller",
     "SkillPath",
     "ReasoningCurriculum", 
-    "StreamingDiLoCo",
-    "DiPaCo_Router",
     "EvolutionStrategies",
     "EvaluatorPool",
     "GuardrailSystem",

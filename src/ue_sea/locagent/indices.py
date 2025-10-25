@@ -6,6 +6,7 @@ Implements ID index, name index, and BM25 index for efficient searching.
 
 import re
 from abc import ABC, abstractmethod
+from functools import lru_cache
 from typing import Dict, List, Optional, Set, Tuple, Any
 import numpy as np
 from rank_bm25 import BM25Okapi
@@ -14,16 +15,34 @@ from rank_bm25 import BM25Okapi
 try:
     import faiss
     FAISS_AVAILABLE = True
+    FAISS_GPU_AVAILABLE = all(
+        hasattr(faiss, attr) for attr in ("index_cpu_to_gpu", "StandardGpuResources")
+    )
 except ImportError:
     FAISS_AVAILABLE = False
+    FAISS_GPU_AVAILABLE = False
     faiss = None
 
 try:
     import cupy as cp
     CUPY_AVAILABLE = True
-except ImportError:
+except ImportError:  # pragma: no cover - optional dependency
     CUPY_AVAILABLE = False
     cp = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    SentenceTransformer = None
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    TORCH_AVAILABLE = False
+    torch = None
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
 
 from .entities import Entity, EntityType
 
@@ -292,7 +311,7 @@ class BM25Index(SparseIndex):
         
         # Create FAISS index
         dimension = self._embeddings.shape[1]
-        if self.use_gpu and CUPY_AVAILABLE and cp.cuda.is_available():
+        if self.use_gpu and CUPY_AVAILABLE and cp.cuda.is_available() and FAISS_GPU_AVAILABLE:
             # Use GPU for FAISS
             self._faiss_index = faiss.IndexFlatIP(dimension)
             self._faiss_index = faiss.index_cpu_to_gpu(
@@ -309,24 +328,122 @@ class BM25Index(SparseIndex):
         """Search using FAISS index for GPU acceleration."""
         if self._faiss_index is None or self._embeddings is None:
             return self.search(query, limit)
-        
+
         # Get query embedding
         query_tokens = self._tokenize(query)
         if not query_tokens:
             return []
-        
+
         query_scores = self._bm25.get_scores(query_tokens)
         query_embedding = np.array([query_scores], dtype=np.float32)
-        
+
         # Search using FAISS
         scores, indices = self._faiss_index.search(query_embedding, limit)
-        
+
         # Return results
         results = []
         for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
             if idx < len(self._entity_ids):
                 results.append((self._entity_ids[idx], float(score)))
-        
+
+        return results
+
+
+class DenseIndex(SparseIndex):
+    """Semantic embedding index backed by FAISS."""
+
+    def __init__(self, use_gpu: bool = True, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+        self.use_gpu = use_gpu and CUPY_AVAILABLE and FAISS_AVAILABLE and FAISS_GPU_AVAILABLE
+        self.model_name = model_name
+        self._encoder: Optional[SentenceTransformer] = None
+        self._entity_ids: List[str] = []
+        self._embeddings: Optional[np.ndarray] = None
+        self._faiss_index: Optional[faiss.Index] = None
+        self._embedding_cache: Dict[str, np.ndarray] = {}
+
+        if SENTENCE_TRANSFORMERS_AVAILABLE:
+            try:
+                device = "cuda" if (torch and torch.cuda.is_available() and use_gpu) else "cpu"
+                self._encoder = SentenceTransformer(self.model_name, device=device)
+            except Exception as exc:  # pragma: no cover - environment specific
+                print(f"Warning: Failed to initialize SentenceTransformer ({exc}); dense retrieval disabled.")
+                self._encoder = None
+        else:
+            print("Warning: sentence-transformers not installed; dense retrieval disabled.")
+
+    def _ensure_index(self) -> None:
+        if not FAISS_AVAILABLE or self._embeddings is None or len(self._embeddings) == 0:
+            self._faiss_index = None
+            return
+
+        dimension = self._embeddings.shape[1]
+        index = faiss.IndexFlatIP(dimension)
+        if self.use_gpu and FAISS_GPU_AVAILABLE and getattr(faiss, "get_num_gpus", lambda: 0)() > 0:
+            resources = faiss.StandardGpuResources()
+            index = faiss.index_cpu_to_gpu(resources, 0, index)
+        index.add(self._embeddings)
+        self._faiss_index = index
+
+    def add_entity(self, entity: Entity) -> None:
+        if self._encoder is None:
+            return
+
+        content = entity.content or entity.docstring
+        if not content:
+            return
+
+        embedding = self._encoder.encode(content, convert_to_numpy=True)
+        self._embedding_cache[entity.entity_id] = embedding
+        self._entity_ids.append(entity.entity_id)
+
+        if self._embeddings is None:
+            self._embeddings = embedding[np.newaxis, :]
+        else:
+            self._embeddings = np.vstack([self._embeddings, embedding])
+
+        self._ensure_index()
+
+    def remove_entity(self, entity_id: str) -> None:
+        if entity_id not in self._entity_ids:
+            return
+
+        idx = self._entity_ids.index(entity_id)
+        self._entity_ids.pop(idx)
+        self._embedding_cache.pop(entity_id, None)
+
+        if self._embeddings is not None:
+            self._embeddings = np.delete(self._embeddings, idx, axis=0)
+            if self._embeddings.size == 0:
+                self._embeddings = None
+
+        self._ensure_index()
+
+    def update_entity(self, entity: Entity) -> None:
+        self.remove_entity(entity.entity_id)
+        self.add_entity(entity)
+
+    def search(self, query: str, limit: int = 10) -> List[Tuple[str, float]]:
+        if self._encoder is None or not self._entity_ids:
+            return []
+
+        query_embedding = self._encoder.encode(query, convert_to_numpy=True)
+        query_embedding = query_embedding[np.newaxis, :]
+
+        if self._faiss_index is None:
+            # Fall back to cosine similarity in numpy
+            embeddings = self._embeddings
+            if embeddings is None:
+                return []
+            scores = embeddings @ query_embedding.T
+            scores = scores.squeeze(-1)
+            top_idx = np.argsort(scores)[::-1][:limit]
+            return [(self._entity_ids[i], float(scores[i])) for i in top_idx]
+
+        scores, indices = self._faiss_index.search(query_embedding, limit)
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            if 0 <= idx < len(self._entity_ids):
+                results.append((self._entity_ids[idx], float(score)))
         return results
 
 
@@ -337,25 +454,33 @@ class HierarchicalIndex:
         self.id_index = IDIndex()
         self.name_index = NameIndex()
         self.bm25_index = BM25Index(use_gpu=use_gpu)
+        self.dense_index = DenseIndex(use_gpu=use_gpu)
         self.use_gpu = use_gpu
+        self._query_cache: Dict[str, List[Tuple[str, float]]] = {}
     
     def add_entity(self, entity: Entity) -> None:
         """Add entity to all indices."""
         self.id_index.add_entity(entity)
         self.name_index.add_entity(entity)
         self.bm25_index.add_entity(entity)
+        self.dense_index.add_entity(entity)
+        self._query_cache.clear()
     
     def remove_entity(self, entity_id: str) -> None:
         """Remove entity from all indices."""
         self.id_index.remove_entity(entity_id)
         self.name_index.remove_entity(entity_id)
         self.bm25_index.remove_entity(entity_id)
+        self.dense_index.remove_entity(entity_id)
+        self._query_cache.clear()
     
     def update_entity(self, entity: Entity) -> None:
         """Update entity in all indices."""
         self.id_index.update_entity(entity)
         self.name_index.update_entity(entity)
         self.bm25_index.update_entity(entity)
+        self.dense_index.update_entity(entity)
+        self._query_cache.clear()
     
     def search(self, query: str, limit: int = 10, 
                search_types: List[str] = None) -> List[Tuple[str, float]]:
@@ -374,11 +499,15 @@ class HierarchicalIndex:
             all_results.extend(name_results)
         
         if "content" in search_types:
-            if self.use_gpu and FAISS_AVAILABLE and self.bm25_index._faiss_index is not None:
+            if self.bm25_index._faiss_index is not None:
                 content_results = self.bm25_index.search_with_faiss(query, limit)
             else:
                 content_results = self.bm25_index.search(query, limit)
             all_results.extend(content_results)
+
+        if "semantic" in search_types:
+            dense_results = self.dense_index.search(query, limit)
+            all_results.extend(dense_results)
         
         # Deduplicate and sort by score
         seen = set()
@@ -390,6 +519,75 @@ class HierarchicalIndex:
         
         unique_results.sort(key=lambda x: x[1], reverse=True)
         return unique_results[:limit]
+
+    def search_hybrid(
+        self,
+        query: str,
+        limit: int = 10,
+        alpha: float = 0.6,
+        candidates: Optional[List[str]] = None,
+        use_cache: bool = True,
+    ) -> List[Tuple[str, float]]:
+        """Hybrid semantic + sparse retrieval with optional reranking."""
+
+        cache_key = None
+        if use_cache and candidates is None:
+            cache_key = f"{query}|{limit}|{alpha:.3f}"
+            if cache_key in self._query_cache:
+                return self._query_cache[cache_key][:limit]
+
+        # Retrieve more candidates for fusion
+        sparse_limit = max(limit * 3, 50)
+        sparse_results = self.bm25_index.search(query, sparse_limit)
+        dense_results = self.dense_index.search(query, sparse_limit)
+
+        sparse_dict = {eid: score for eid, score in sparse_results}
+        dense_dict = {eid: score for eid, score in dense_results}
+
+        all_entity_ids = set(sparse_dict.keys()) | set(dense_dict.keys())
+        if candidates:
+            allowed = set(candidates)
+            all_entity_ids &= allowed
+
+        if not all_entity_ids:
+            return []
+
+        # Normalise scores
+        def normalise(score_dict: Dict[str, float]) -> Dict[str, float]:
+            if not score_dict:
+                return {}
+            values = np.array(list(score_dict.values()))
+            max_abs = np.max(np.abs(values))
+            if max_abs == 0:
+                return {k: 0.0 for k in score_dict}
+            return {k: v / max_abs for k, v in score_dict.items()}
+
+        sparse_norm = normalise(sparse_dict)
+        dense_norm = normalise(dense_dict)
+
+        fused_scores: Dict[str, float] = {}
+        for entity_id in all_entity_ids:
+            sparse_score = sparse_norm.get(entity_id, 0.0)
+            dense_score = dense_norm.get(entity_id, 0.0)
+            fused_scores[entity_id] = alpha * dense_score + (1 - alpha) * sparse_score
+
+        # Final rerank by BM25 score as a tie-breaker
+        results = [
+            (
+                entity_id,
+                fused_scores[entity_id],
+                sparse_dict.get(entity_id, 0.0),
+                dense_dict.get(entity_id, 0.0),
+            )
+            for entity_id in fused_scores
+        ]
+        results.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        final_records = results[:limit]
+
+        if cache_key:
+            self._query_cache[cache_key] = final_records
+
+        return final_records
     
     def get_entity(self, entity_id: str) -> Optional[Entity]:
         """Get entity by ID."""
@@ -398,3 +596,6 @@ class HierarchicalIndex:
     def get_all_entities(self) -> List[Entity]:
         """Get all entities."""
         return self.id_index.get_all_entities()
+
+    def clear_cache(self) -> None:
+        self._query_cache.clear()

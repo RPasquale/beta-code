@@ -5,6 +5,7 @@ Implements ensemble of fast and powerful models for diff generation.
 """
 
 import asyncio
+import os
 import random
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
@@ -19,10 +20,17 @@ except ImportError:
     OPENAI_AVAILABLE = False
 
 try:
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline as hf_pipeline
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
+    hf_pipeline = None
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 
 class ModelType(Enum):
@@ -107,12 +115,19 @@ class LLM_Ensemble:
         
         # Local models for specialized tasks
         if TRANSFORMERS_AVAILABLE:
+            local_model_id = os.getenv(
+                "UE_SEA_LOCAL_MODEL",
+                "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+            )
+            max_tokens = int(os.getenv("UE_SEA_LOCAL_MODEL_MAX_TOKENS", "2048"))
+            model_name = local_model_id.split("/")[-1] or local_model_id
             configs.append(ModelConfig(
-                name="code-llama-7b",
+                name=model_name,
                 model_type=ModelType.SPECIALIZED,
-                model_path="codellama/CodeLlama-7b-Python-hf",
-                max_tokens=1024,
-                temperature=0.3
+                model_path=local_model_id,
+                max_tokens=max_tokens,
+                temperature=0.3,
+                metadata={"model_id": local_model_id}
             ))
         
         return configs
@@ -130,14 +145,45 @@ class LLM_Ensemble:
             elif config.model_type == ModelType.SPECIALIZED:
                 # Local models
                 if TRANSFORMERS_AVAILABLE and config.model_path:
-                    tokenizer = AutoTokenizer.from_pretrained(config.model_path)
-                    model = AutoModelForCausalLM.from_pretrained(config.model_path)
-                    
+                    print(f"Loading local model '{config.model_path}' for ensemble generation...")
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        config.model_path,
+                        trust_remote_code=True
+                    )
+
+                    model_kwargs: Dict[str, Any] = {"trust_remote_code": True}
+                    dtype_preference = os.getenv("UE_SEA_LOCAL_MODEL_DTYPE", "").lower()
+                    if TORCH_AVAILABLE:
+                        if dtype_preference == "float16" and hasattr(torch, "float16"):
+                            model_kwargs["torch_dtype"] = torch.float16
+                        elif dtype_preference == "bfloat16" and hasattr(torch, "bfloat16"):
+                            model_kwargs["torch_dtype"] = torch.bfloat16
+                        device_preference = os.getenv("UE_SEA_LOCAL_MODEL_DEVICE", "").lower()
+                        if device_preference == "cuda" and torch.cuda.is_available():
+                            model_kwargs["device_map"] = "auto"
+
+                    model = AutoModelForCausalLM.from_pretrained(
+                        config.model_path,
+                        **model_kwargs
+                    )
+
+                    generation_pipeline = None
+                    if hf_pipeline:
+                        try:
+                            generation_pipeline = hf_pipeline(
+                                "text-generation",
+                                model=model,
+                                tokenizer=tokenizer
+                            )
+                        except Exception as pipeline_error:
+                            print(f"Warning: Failed to create pipeline for {config.name}: {pipeline_error}")
+
                     self.models[config.name] = {
                         "type": "local",
                         "config": config,
                         "tokenizer": tokenizer,
                         "model": model,
+                        "pipeline": generation_pipeline,
                         "initialized": True
                     }
                 else:
@@ -285,29 +331,92 @@ class LLM_Ensemble:
         try:
             tokenizer = model_info["tokenizer"]
             model = model_info["model"]
+            generation_pipeline = model_info.get("pipeline")
+            
+            system_prompt = os.getenv(
+                "UE_SEA_LOCAL_SYSTEM_PROMPT",
+                "You are a senior software engineer generating precise code updates."
+            )
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ]
+            
+            max_new_tokens = min(
+                config.max_tokens,
+                int(os.getenv("UE_SEA_LOCAL_MODEL_MAX_NEW_TOKENS", "256"))
+            )
+            
+            if hasattr(tokenizer, "apply_chat_template"):
+                prompt_text = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False
+                )
+            else:
+                prompt_text = f"{system_prompt}\n\nUser:\n{prompt}\nAssistant:"
+            
+            if generation_pipeline is not None:
+                outputs = generation_pipeline(
+                    prompt_text,
+                    max_new_tokens=max_new_tokens,
+                    temperature=config.temperature,
+                    top_p=config.top_p,
+                    do_sample=True,
+                    return_full_text=False
+                )
+                if outputs:
+                    generated = outputs[0].get("generated_text") or outputs[0].get("text", "")
+                    return generated.strip()
             
             # Tokenize input
-            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=config.max_tokens)
+            if not TORCH_AVAILABLE:
+                raise RuntimeError("PyTorch is required for local generation but is not available.")
+            
+            if hasattr(tokenizer, "apply_chat_template"):
+                chat_inputs = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_tensors="pt"
+                )
+                if isinstance(chat_inputs, dict):
+                    inputs = chat_inputs
+                else:
+                    inputs = {"input_ids": chat_inputs}
+            else:
+                inputs = tokenizer(
+                prompt_text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=config.max_tokens
+            )
+            
+            device = next(model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            pad_token_id = getattr(tokenizer, "pad_token_id", None)
+            if pad_token_id is None and hasattr(tokenizer, "eos_token_id"):
+                pad_token_id = tokenizer.eos_token_id
             
             # Generate
             with torch.no_grad():
                 outputs = model.generate(
-                    inputs.input_ids,
-                    max_length=config.max_tokens,
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
                     temperature=config.temperature,
                     top_p=config.top_p,
                     do_sample=True,
-                    pad_token_id=tokenizer.eos_token_id
+                    pad_token_id=pad_token_id
                 )
             
             # Decode output
-            result = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            if hasattr(tokenizer, "apply_chat_template"):
+                generated_tokens = outputs[0][inputs["input_ids"].shape[-1]:]
+                result = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            else:
+                result = tokenizer.decode(outputs[0], skip_special_tokens=True)
             
-            # Remove input from output
-            if prompt in result:
-                result = result.replace(prompt, "").strip()
-            
-            return result
+            return result.strip()
             
         except Exception as e:
             print(f"Local generation error: {e}")

@@ -9,7 +9,7 @@ from .controller import AlphaEvolve_Controller
 from .prompt_sampler import PromptSampler
 from .llm_ensemble import LLM_Ensemble
 from .diff_generator import DiffGenerator
-from .evaluators import EvaluatorPool, StagedEvaluator
+from ..evaluation.evaluators import EvaluatorPool, StagedEvaluator
 from .evolutionary_db import EvolutionaryDB, MAP_Elites_Selector
 
 __all__ = [

@@ -6,6 +6,7 @@ Implements the main graph with entities, relations, and hierarchical indices.
 
 import os
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Any, Union
 import networkx as nx
@@ -16,6 +17,15 @@ from .entities import Entity, EntityType, Relation, RelationType
 from .indices import HierarchicalIndex
 from .parser import PythonParser, JavaScriptParser, TypeScriptParser
 from .tools import SearchEntity, TraverseGraph, RetrieveEntity
+
+
+@dataclass
+class HybridSearchResult:
+    entity: Entity
+    score: float
+    sparse_score: float
+    dense_score: float
+    distance: Optional[int] = None
 
 
 class LOCAGENT_Graph:
@@ -32,6 +42,11 @@ class LOCAGENT_Graph:
         self._relations: Dict[str, Relation] = {}
         self._index = HierarchicalIndex(use_gpu=use_gpu)
         self._graph = nx.DiGraph()
+        
+        # Semantic relationships and usage patterns
+        self._semantic_relationships: Dict[str, List[str]] = {}
+        self._usage_patterns: Dict[str, Dict[str, Any]] = {}
+        self._co_occurrence_matrix: Dict[str, Dict[str, float]] = {}
         
         # Initialize parsers
         self._parsers = self._initialize_parsers()
@@ -234,9 +249,95 @@ class LOCAGENT_Graph:
         return self._graph.subgraph(subgraph_nodes)
     
     def search_entities(self, query: str, limit: int = 10,
-                       search_types: List[str] = None) -> List[Tuple[str, float]]:
+                       search_types: List[str] = None,
+                       hybrid: bool = False,
+                       alpha: float = 0.6) -> List[Tuple[str, float]]:
         """Search for entities using the hierarchical index."""
+        if hybrid:
+            results = self._index.search_hybrid(query, limit=limit, alpha=alpha)
+            return [(entity_id, score) for entity_id, score, _, _ in results]
         return self._index.search(query, limit, search_types)
+
+    def search_hybrid(
+        self,
+        query: str,
+        limit: int = 10,
+        alpha: float = 0.6,
+        use_cache: bool = True,
+    ) -> List[HybridSearchResult]:
+        records = self._index.search_hybrid(
+            query,
+            limit=limit,
+            alpha=alpha,
+            use_cache=use_cache,
+        )
+        results: List[HybridSearchResult] = []
+        for entity_id, fused_score, sparse_score, dense_score in records:
+            entity = self.get_entity(entity_id)
+            if entity:
+                results.append(
+                    HybridSearchResult(
+                        entity=entity,
+                        score=fused_score,
+                        sparse_score=sparse_score,
+                        dense_score=dense_score,
+                    )
+                )
+        return results
+
+    def search_with_context(
+        self,
+        query: str,
+        context_entities: List[str],
+        hops: int = 2,
+        limit: int = 10,
+        alpha: float = 0.6,
+    ) -> List[HybridSearchResult]:
+        if not context_entities:
+            return self.search_hybrid(query, limit=limit, alpha=alpha, use_cache=False)
+
+        subgraph = self.get_subgraph(context_entities, max_hops=hops)
+        candidate_ids = list(subgraph.nodes())
+        if not candidate_ids:
+            return self.search_hybrid(query, limit=limit, alpha=alpha, use_cache=False)
+
+        records = self._index.search_hybrid(
+            query,
+            limit=limit * 2,
+            alpha=alpha,
+            candidates=candidate_ids,
+            use_cache=False,
+        )
+
+        undirected = subgraph.to_undirected()
+        try:
+            distance_map = nx.multi_source_dijkstra_path_length(
+                undirected, context_entities, cutoff=hops
+            )
+        except Exception:
+            distance_map = {}
+
+        boosted: List[HybridSearchResult] = []
+        for entity_id, fused_score, sparse_score, dense_score in records:
+            entity = self.get_entity(entity_id)
+            if not entity:
+                continue
+            distance = distance_map.get(entity_id)
+            boost = 1.0
+            if distance is not None:
+                boost += max(0, hops - distance + 1) * 0.1
+            boosted.append(
+                HybridSearchResult(
+                    entity=entity,
+                    score=fused_score * boost,
+                    sparse_score=sparse_score,
+                    dense_score=dense_score,
+                    distance=distance,
+                )
+            )
+
+        boosted.sort(key=lambda r: r.score, reverse=True)
+        return boosted[:limit]
     
     def get_entity_statistics(self) -> Dict[str, Any]:
         """Get statistics about the graph."""
@@ -256,7 +357,106 @@ class LOCAGENT_Graph:
             "relation_types": relation_types,
             "graph_density": nx.density(self._graph),
             "connected_components": nx.number_weakly_connected_components(self._graph.to_undirected()),
+            "semantic_relationships": len(self._semantic_relationships),
+            "usage_patterns": len(self._usage_patterns),
         }
+    
+    def add_semantic_relationship(self, entity_id: str, related_entities: List[str], 
+                                relationship_type: str = "semantic") -> None:
+        """Add semantic relationships between entities."""
+        if entity_id not in self._semantic_relationships:
+            self._semantic_relationships[entity_id] = []
+        
+        for related_id in related_entities:
+            if related_id not in self._semantic_relationships[entity_id]:
+                self._semantic_relationships[entity_id].append(related_id)
+    
+    def get_semantic_relationships(self, entity_id: str) -> List[str]:
+        """Get semantic relationships for an entity."""
+        return self._semantic_relationships.get(entity_id, [])
+    
+    def add_usage_pattern(self, entity_id: str, pattern_type: str, 
+                         pattern_data: Dict[str, Any]) -> None:
+        """Add usage pattern for an entity."""
+        if entity_id not in self._usage_patterns:
+            self._usage_patterns[entity_id] = {}
+        
+        self._usage_patterns[entity_id][pattern_type] = pattern_data
+    
+    def get_usage_patterns(self, entity_id: str) -> Dict[str, Any]:
+        """Get usage patterns for an entity."""
+        return self._usage_patterns.get(entity_id, {})
+    
+    def update_co_occurrence(self, entity1_id: str, entity2_id: str, weight: float = 1.0) -> None:
+        """Update co-occurrence matrix between entities."""
+        if entity1_id not in self._co_occurrence_matrix:
+            self._co_occurrence_matrix[entity1_id] = {}
+        
+        if entity2_id not in self._co_occurrence_matrix:
+            self._co_occurrence_matrix[entity2_id] = {}
+        
+        # Update both directions
+        self._co_occurrence_matrix[entity1_id][entity2_id] = weight
+        self._co_occurrence_matrix[entity2_id][entity1_id] = weight
+    
+    def get_co_occurrence_score(self, entity1_id: str, entity2_id: str) -> float:
+        """Get co-occurrence score between two entities."""
+        return self._co_occurrence_matrix.get(entity1_id, {}).get(entity2_id, 0.0)
+    
+    def find_semantically_similar_entities(self, entity_id: str, threshold: float = 0.5) -> List[Tuple[str, float]]:
+        """Find entities that are semantically similar based on co-occurrence."""
+        if entity_id not in self._co_occurrence_matrix:
+            return []
+        
+        similar_entities = []
+        for other_entity, score in self._co_occurrence_matrix[entity_id].items():
+            if score >= threshold and other_entity != entity_id:
+                similar_entities.append((other_entity, score))
+        
+        return sorted(similar_entities, key=lambda x: x[1], reverse=True)
+    
+    def analyze_usage_patterns(self) -> Dict[str, Any]:
+        """Analyze usage patterns across all entities."""
+        pattern_analysis = {
+            "total_patterns": sum(len(patterns) for patterns in self._usage_patterns.values()),
+            "pattern_types": {},
+            "most_used_entities": [],
+            "pattern_clusters": {}
+        }
+        
+        # Count pattern types
+        for entity_id, patterns in self._usage_patterns.items():
+            for pattern_type in patterns.keys():
+                pattern_analysis["pattern_types"][pattern_type] = \
+                    pattern_analysis["pattern_types"].get(pattern_type, 0) + 1
+        
+        # Find most used entities
+        entity_usage = [(entity_id, len(patterns)) 
+                        for entity_id, patterns in self._usage_patterns.items()]
+        pattern_analysis["most_used_entities"] = sorted(entity_usage, key=lambda x: x[1], reverse=True)[:10]
+        
+        return pattern_analysis
+    
+    def get_semantic_neighborhood(self, entity_id: str, depth: int = 2) -> Set[str]:
+        """Get semantic neighborhood of an entity."""
+        neighborhood = set()
+        current_level = {entity_id}
+        
+        for _ in range(depth):
+            next_level = set()
+            for entity in current_level:
+                # Add semantic relationships
+                semantic_relations = self.get_semantic_relationships(entity)
+                next_level.update(semantic_relations)
+                
+                # Add co-occurrence relationships
+                co_occurrence_relations = self._co_occurrence_matrix.get(entity, {})
+                next_level.update([eid for eid, score in co_occurrence_relations.items() if score > 0.3])
+            
+            neighborhood.update(next_level)
+            current_level = next_level - neighborhood  # Avoid infinite loops
+        
+        return neighborhood - {entity_id}  # Remove the original entity
     
     def save_to_file(self, file_path: str) -> None:
         """Save graph to file."""

@@ -161,47 +161,90 @@ class LOCAGENT_Agent:
     async def _decide_action(self, issue_description: str, 
                            context: Optional[Dict[str, Any]] = None) -> AgentAction:
         """
-        Decide next action based on current state.
+        Enhanced decision making with multi-step reasoning and hypothesis validation.
         
-        This is where the LLM policy would be implemented.
-        For now, we use a simple heuristic-based approach.
+        Uses advanced reasoning patterns:
+        1. Hypothesis generation based on issue analysis
+        2. Multi-step reasoning chains
+        3. Evidence gathering and validation
+        4. Adaptive search strategies
         """
-        # If we have good candidates, try to traverse and get more context
-        if len(self.candidate_entities) > 0 and self.current_step < self.max_steps - 2:
-            # Get the top candidate
-            top_entity_id = max(self.candidate_entities.items(), key=lambda x: x[1])[0]
+        # Generate hypotheses about the issue
+        hypotheses = self._generate_hypotheses(issue_description)
+        
+        # Multi-step reasoning: analyze current state and plan next steps
+        reasoning_chain = self._build_reasoning_chain(issue_description, hypotheses)
+        
+        # Validate hypotheses based on current evidence
+        validated_hypotheses = self._validate_hypotheses(hypotheses)
+        
+        # Decide action based on reasoning chain and validated hypotheses
+        if self.current_step == 0:
+            # Initial search with hypothesis-driven keywords
+            keywords = self._extract_hypothesis_keywords(validated_hypotheses)
+            return AgentAction(
+                action_type=ActionType.SEARCH_ENTITY,
+                parameters={
+                    "keywords": keywords,
+                    "entity_types": [EntityType.FUNCTION, EntityType.CLASS, EntityType.FILE],
+                    "limit": 10
+                },
+                reasoning=f"Initial search based on hypotheses: {', '.join(validated_hypotheses[:3])}",
+                confidence=0.9
+            )
+        
+        elif len(self.candidate_entities) > 0 and self.current_step < self.max_steps - 3:
+            # Multi-hop traversal with reasoning
+            top_candidates = sorted(self.candidate_entities.items(), key=lambda x: x[1], reverse=True)[:3]
+            start_ids = [entity_id for entity_id, _ in top_candidates]
             
             return AgentAction(
                 action_type=ActionType.TRAVERSE_GRAPH,
                 parameters={
-                    "start_ids": [top_entity_id],
+                    "start_ids": start_ids,
                     "direction": "both",
                     "hops": 2,
-                    "entity_types": [EntityType.FUNCTION, EntityType.CLASS]
+                    "entity_types": [EntityType.FUNCTION, EntityType.CLASS],
+                    "relation_types": ["invoke", "import", "inherit"]
                 },
-                reasoning=f"Traversing from top candidate {top_entity_id} to find related entities",
+                reasoning=f"Multi-hop traversal from top candidates to gather evidence for hypotheses",
                 confidence=0.8
             )
         
-        # If we have traversed entities, retrieve their details
-        elif len(self.visited_entities) > 0 and self.current_step < self.max_steps - 1:
-            entity_ids = list(self.visited_entities)[:5]  # Limit to 5 entities
+        elif len(self.visited_entities) > 0 and self.current_step < self.max_steps - 2:
+            # Retrieve detailed information for hypothesis validation
+            entity_ids = list(self.visited_entities)[:5]
             
             return AgentAction(
                 action_type=ActionType.RETRIEVE_ENTITY,
                 parameters={"entity_ids": entity_ids},
-                reasoning="Retrieving detailed information about visited entities",
+                reasoning="Retrieving detailed entity information for hypothesis validation",
                 confidence=0.9
             )
         
-        # Otherwise, stop
-        else:
-            return AgentAction(
-                action_type=ActionType.STOP,
-                parameters={},
-                reasoning="No more productive actions available",
-                confidence=1.0
-            )
+        elif self.current_step < self.max_steps - 1:
+            # Additional search based on reasoning chain
+            additional_keywords = self._extract_additional_keywords(reasoning_chain)
+            if additional_keywords:
+                return AgentAction(
+                    action_type=ActionType.SEARCH_ENTITY,
+                    parameters={
+                        "keywords": additional_keywords,
+                        "entity_types": [EntityType.FUNCTION, EntityType.CLASS],
+                        "limit": 5
+                    },
+                    reasoning="Additional search based on reasoning chain insights",
+                    confidence=0.7
+                )
+        
+        # Stop with confidence assessment
+        final_confidence = self._assess_final_confidence(validated_hypotheses)
+        return AgentAction(
+            action_type=ActionType.STOP,
+            parameters={},
+            reasoning=f"Reasoning complete. Final confidence: {final_confidence:.2f}",
+            confidence=final_confidence
+        )
     
     async def _execute_action(self, action: AgentAction) -> AgentObservation:
         """Execute an action and return the observation."""
@@ -247,6 +290,96 @@ class LOCAGENT_Agent:
                 error_message=str(e)
             )
     
+    def _generate_hypotheses(self, issue_description: str) -> List[str]:
+        """Generate hypotheses about what the issue might involve."""
+        # Simple hypothesis generation based on common patterns
+        hypotheses = []
+        
+        # Extract key terms
+        words = issue_description.lower().split()
+        
+        # Common issue patterns
+        if any(word in words for word in ['error', 'exception', 'fail', 'crash']):
+            hypotheses.extend(['error_handling', 'exception_management', 'logging'])
+        
+        if any(word in words for word in ['slow', 'performance', 'timeout', 'lag']):
+            hypotheses.extend(['performance_optimization', 'caching', 'database_query'])
+        
+        if any(word in words for word in ['auth', 'login', 'security', 'permission']):
+            hypotheses.extend(['authentication', 'authorization', 'security_middleware'])
+        
+        if any(word in words for word in ['api', 'endpoint', 'request', 'response']):
+            hypotheses.extend(['api_handling', 'request_processing', 'response_formatting'])
+        
+        if any(word in words for word in ['database', 'query', 'sql', 'data']):
+            hypotheses.extend(['database_operations', 'data_validation', 'query_optimization'])
+        
+        return hypotheses[:5]  # Limit to top 5 hypotheses
+    
+    def _build_reasoning_chain(self, issue_description: str, hypotheses: List[str]) -> List[str]:
+        """Build a reasoning chain based on issue and hypotheses."""
+        reasoning_chain = []
+        
+        # Step 1: Analyze issue type
+        if 'error' in issue_description.lower():
+            reasoning_chain.append("Issue involves error handling - need to find error sources and handlers")
+        
+        # Step 2: Consider related components
+        for hypothesis in hypotheses[:3]:
+            reasoning_chain.append(f"Hypothesis: {hypothesis} - search for related components")
+        
+        # Step 3: Plan investigation strategy
+        reasoning_chain.append("Multi-hop traversal to find interconnected components")
+        reasoning_chain.append("Validate findings with detailed entity retrieval")
+        
+        return reasoning_chain
+    
+    def _validate_hypotheses(self, hypotheses: List[str]) -> List[str]:
+        """Validate hypotheses based on current evidence."""
+        validated = []
+        
+        for hypothesis in hypotheses:
+            # Simple validation based on current candidates
+            if any(hypothesis.split('_')[0] in entity_id.lower() 
+                   for entity_id in self.candidate_entities.keys()):
+                validated.append(hypothesis)
+        
+        return validated if validated else hypotheses[:2]  # Fallback to top 2
+    
+    def _extract_hypothesis_keywords(self, hypotheses: List[str]) -> List[str]:
+        """Extract keywords from validated hypotheses."""
+        keywords = []
+        for hypothesis in hypotheses:
+            # Split hypothesis into words
+            words = hypothesis.replace('_', ' ').split()
+            keywords.extend(words)
+        
+        return keywords[:10]  # Limit keywords
+    
+    def _extract_additional_keywords(self, reasoning_chain: List[str]) -> List[str]:
+        """Extract additional keywords from reasoning chain."""
+        keywords = []
+        for step in reasoning_chain:
+            # Extract meaningful words
+            words = step.lower().split()
+            keywords.extend([w for w in words if len(w) > 3 and w not in ['need', 'find', 'search']])
+        
+        return keywords[:5]  # Limit additional keywords
+    
+    def _assess_final_confidence(self, validated_hypotheses: List[str]) -> float:
+        """Assess final confidence based on evidence gathered."""
+        if not self.candidate_entities:
+            return 0.1
+        
+        # Base confidence on number of candidates and their scores
+        num_candidates = len(self.candidate_entities)
+        avg_score = sum(self.candidate_entities.values()) / num_candidates if num_candidates > 0 else 0
+        
+        # Higher confidence with more candidates and higher scores
+        confidence = min(0.9, 0.3 + (num_candidates * 0.1) + (avg_score * 0.3))
+        
+        return confidence
+
     def _update_state(self, observation: AgentObservation) -> None:
         """Update agent state based on observation."""
         if not observation.success:

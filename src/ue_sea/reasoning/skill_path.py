@@ -345,8 +345,7 @@ class SkillPath:
             "is_trained": self.is_trained,
             "metrics": self.metrics.__dict__,
             "performance_stats": self.get_performance_stats()
-        }
-    
+        }    
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> SkillPath:
         """Create skill from dictionary."""
@@ -361,3 +360,4 @@ class SkillPath:
         skill.metrics = SkillMetrics(**data.get("metrics", {}))
         
         return skill
+

@@ -88,9 +88,9 @@ class RewardHackingDetector:
                 r"await\s+asyncio\.sleep\(0\)",
             ],
             HackingPattern.TOKEN_EXPLOIT: [
-                r"#\s*".*" * 1000",
-                r"print\(.*\) * 100",
-                r"logging\.debug\(.*\) * 100",
+                r'#\s*".*"\s*\*\s*1000',
+                r"print\(.*\)\s*\*\s*100",
+                r"logging\.debug\(.*\)\s*\*\s*100",
             ],
             HackingPattern.COMPLEXITY_EXPLOIT: [
                 r"if\s+True:",
@@ -256,8 +256,7 @@ class GuardrailSystem:
                 "quality_violations": quality_violations,
                 "hacking_score": hacking_score,
             }
-        )
-    
+        )    
     def _check_safety_rules(self, code: str, metrics: Dict[str, float]) -> List[str]:
         """Check code against safety rules."""
         violations = []
@@ -358,3 +357,4 @@ class GuardrailSystem:
             "hacking_patterns": len(self.hacking_detector.patterns),
             "total_patterns": sum(len(patterns) for patterns in self.hacking_detector.patterns.values()),
         }
+

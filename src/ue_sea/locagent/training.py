@@ -93,7 +93,7 @@ class LocalizationDataset(Dataset):
 
 
 class LOCAGENT_Trainer:
-    """Trainer for the LOCAGENT agent."""
+    """Enhanced trainer for the LOCAGENT agent with real-time evaluation and feedback."""
     
     def __init__(self, model_name: str = "microsoft/DialoGPT-medium", 
                  use_gpu: bool = True):
@@ -102,6 +102,18 @@ class LOCAGENT_Trainer:
         self.tokenizer = None
         self.model = None
         self.logger = logging.getLogger(__name__)
+        
+        # Real-time evaluation and feedback
+        self.evaluation_metrics = {
+            "accuracy_at_k": [],
+            "precision_at_k": [],
+            "recall_at_k": [],
+            "f1_at_k": [],
+            "training_loss": [],
+            "validation_loss": []
+        }
+        self.feedback_history = []
+        self.performance_trends = {}
     
     def load_model(self):
         """Load the base model and tokenizer."""
@@ -129,6 +141,106 @@ class LOCAGENT_Trainer:
         val_dataset = LocalizationDataset(val_examples, self.tokenizer)
         
         return train_dataset, val_dataset
+    
+    def evaluate_realtime(self, predictions: List[str], ground_truth: List[str], k: int = 5) -> Dict[str, float]:
+        """Real-time evaluation of predictions against ground truth."""
+        # Calculate accuracy@k
+        accuracy_at_k = self._calculate_accuracy_at_k(predictions, ground_truth, k)
+        
+        # Calculate precision@k
+        precision_at_k = self._calculate_precision_at_k(predictions, ground_truth, k)
+        
+        # Calculate recall@k
+        recall_at_k = self._calculate_recall_at_k(predictions, ground_truth, k)
+        
+        # Calculate F1@k
+        f1_at_k = self._calculate_f1_at_k(precision_at_k, recall_at_k)
+        
+        # Update metrics
+        self.evaluation_metrics["accuracy_at_k"].append(accuracy_at_k)
+        self.evaluation_metrics["precision_at_k"].append(precision_at_k)
+        self.evaluation_metrics["recall_at_k"].append(recall_at_k)
+        self.evaluation_metrics["f1_at_k"].append(f1_at_k)
+        
+        return {
+            "accuracy_at_k": accuracy_at_k,
+            "precision_at_k": precision_at_k,
+            "recall_at_k": recall_at_k,
+            "f1_at_k": f1_at_k
+        }
+    
+    def _calculate_accuracy_at_k(self, predictions: List[str], ground_truth: List[str], k: int) -> float:
+        """Calculate accuracy@k metric."""
+        if not predictions or not ground_truth:
+            return 0.0
+        
+        top_k_predictions = predictions[:k]
+        return len(set(top_k_predictions) & set(ground_truth)) / len(ground_truth)
+    
+    def _calculate_precision_at_k(self, predictions: List[str], ground_truth: List[str], k: int) -> float:
+        """Calculate precision@k metric."""
+        if not predictions:
+            return 0.0
+        
+        top_k_predictions = predictions[:k]
+        relevant_predictions = set(top_k_predictions) & set(ground_truth)
+        return len(relevant_predictions) / len(top_k_predictions)
+    
+    def _calculate_recall_at_k(self, predictions: List[str], ground_truth: List[str], k: int) -> float:
+        """Calculate recall@k metric."""
+        if not ground_truth:
+            return 0.0
+        
+        top_k_predictions = predictions[:k]
+        relevant_predictions = set(top_k_predictions) & set(ground_truth)
+        return len(relevant_predictions) / len(ground_truth)
+    
+    def _calculate_f1_at_k(self, precision: float, recall: float) -> float:
+        """Calculate F1@k metric."""
+        if precision + recall == 0:
+            return 0.0
+        return 2 * (precision * recall) / (precision + recall)
+    
+    def generate_feedback(self, current_metrics: Dict[str, float], 
+                         previous_metrics: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+        """Generate feedback based on current and previous metrics."""
+        feedback = {
+            "timestamp": asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else 0,
+            "current_metrics": current_metrics,
+            "feedback_type": "positive",
+            "suggestions": [],
+            "performance_trend": "stable"
+        }
+        
+        if previous_metrics:
+            # Calculate performance trends
+            for metric, current_value in current_metrics.items():
+                if metric in previous_metrics:
+                    previous_value = previous_metrics[metric]
+                    improvement = current_value - previous_value
+                    
+                    if improvement > 0.05:
+                        feedback["performance_trend"] = "improving"
+                        feedback["suggestions"].append(f"{metric} improved by {improvement:.3f}")
+                    elif improvement < -0.05:
+                        feedback["performance_trend"] = "declining"
+                        feedback["suggestions"].append(f"{metric} declined by {abs(improvement):.3f}")
+        
+        # Generate specific feedback based on metrics
+        if current_metrics.get("accuracy_at_k", 0) < 0.3:
+            feedback["feedback_type"] = "negative"
+            feedback["suggestions"].append("Low accuracy - consider more training data or longer training")
+        
+        if current_metrics.get("precision_at_k", 0) < 0.4:
+            feedback["suggestions"].append("Low precision - model may be too permissive")
+        
+        if current_metrics.get("recall_at_k", 0) < 0.4:
+            feedback["suggestions"].append("Low recall - model may be missing relevant entities")
+        
+        # Store feedback
+        self.feedback_history.append(feedback)
+        
+        return feedback
     
     def train(self, train_dataset: LocalizationDataset, 
               val_dataset: LocalizationDataset,

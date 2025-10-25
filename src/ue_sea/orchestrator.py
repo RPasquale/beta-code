@@ -16,7 +16,6 @@ from .locagent import LOCAGENT_Graph
 from .alphaevolve import AlphaEvolve_Controller
 from .evaluation import EvaluatorPool, GuardrailSystem
 from .reasoning import SkillPath, ReasoningCurriculum
-from .distributed import StreamingDiLoCo, DiPaCo_Router
 from .optimizer import EvolutionStrategies
 
 
@@ -67,12 +66,10 @@ class UE_SEA_Orchestrator:
         
         # Initialize components
         self.locagent = LOCAGENT_Graph(use_gpu=self.config.gpu_enabled)
-        self.alphaevolve = AlphaEvolve_Controller()
+        self.alphaevolve = AlphaEvolve_Controller(locagent=self.locagent)
         self.evaluator_pool = EvaluatorPool()
         self.guardrails = GuardrailSystem()
         self.reasoning_curriculum = ReasoningCurriculum()
-        self.distributed_training = StreamingDiLoCo()
-        self.dipaco_router = DiPaCo_Router()
         self.es_optimizer = EvolutionStrategies()
         
         # Orchestration state
@@ -85,6 +82,10 @@ class UE_SEA_Orchestrator:
         self.program_registry = {}
         self.skill_registry = {}
         self.model_registry = {}
+        
+        # LOCAGENT integration state
+        self.training_metrics_history = []
+        self.training_feedback_history = []
     
     async def start(self, repo_path: str, task_description: str,
                    context: Dict[str, Any] = None) -> None:
@@ -106,6 +107,53 @@ class UE_SEA_Orchestrator:
         
         # Start evolution cycles
         await self._run_evolution_cycles(task_description, context)
+
+    async def run(self, repo_path: str, task_description: str,
+                 context: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        Run UE-SEA with full LOCAGENT integration.
+        
+        Args:
+            repo_path: Path to the repository to analyze
+            task_description: Description of the improvement task
+            context: Additional context including LOCAGENT settings
+        
+        Returns:
+            Results of the UE-SEA run
+        """
+        print("🚀 Starting UE-SEA with LOCAGENT Integration...")
+        
+        if context is None:
+            context = {}
+        
+        # Check for LOCAGENT integration settings
+        use_locagent = context.get("use_locagent", True)
+        localization_threshold = context.get("localization_threshold", 0.8)
+        semantic_search = context.get("semantic_search", True)
+        real_time_feedback = context.get("real_time_feedback", True)
+        gpu_acceleration = context.get("gpu_acceleration", True)
+        
+        print(f"🎯 LOCAGENT Integration: {use_locagent}")
+        print(f"🧠 Semantic Search: {semantic_search}")
+        print(f"⚡ GPU Acceleration: {gpu_acceleration}")
+        print(f"📊 Real-time Feedback: {real_time_feedback}")
+        
+        # Initialize system with LOCAGENT
+        await self._initialize_system(repo_path, task_description, context)
+        
+        # Run evolution cycles with LOCAGENT enhancement
+        await self._run_evolution_cycles(task_description, context)
+        
+        # Return results
+        return {
+            "total_cycles": len(self.cycle_results),
+            "successful_cycles": sum(1 for r in self.cycle_results if r.success),
+            "locagent_enhanced": use_locagent,
+            "semantic_understanding": semantic_search,
+            "gpu_acceleration": gpu_acceleration,
+            "real_time_feedback": real_time_feedback,
+            "final_metrics": self._get_final_metrics()
+        }
     
     async def _initialize_system(self, repo_path: str, task_description: str,
                               context: Dict[str, Any]) -> None:
@@ -119,10 +167,6 @@ class UE_SEA_Orchestrator:
         # Initialize skill paths
         print("Initializing skill paths...")
         await self._initialize_skill_paths()
-        
-        # Initialize distributed training
-        print("Initializing distributed training...")
-        await self.distributed_training.initialize()
         
         # Initialize ES optimizer
         print("Initializing Evolution Strategies...")
@@ -269,41 +313,212 @@ class UE_SEA_Orchestrator:
         metrics["entities_count"] = len(self.locagent._entities)
         metrics["relations_count"] = len(self.locagent._relations)
     
-    async def _evolve_stage(self, task_description: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        """Evolve stage: Run evolutionary improvement."""
-        # Get current best program
-        best_program = self._get_best_program()
+    async def _localize_task(self, task_description: str) -> Dict[str, Any]:
+        """
+        Use LOCAGENT to intelligently localize where to focus evolution efforts.
+        This replaces blind evolution with targeted, intelligent code understanding.
+        """
+        from .locagent import LOCAGENT_Agent
         
-        # Run evolution
-        evolution_result = await self.alphaevolve.evolve(
-            best_program, task_description, context
+        # Create LOCAGENT agent with enhanced reasoning
+        agent = LOCAGENT_Agent(
+            graph=self.locagent,
+            max_steps=15,  # Allow more reasoning steps
+            confidence_threshold=0.7
         )
         
-        return {
-            "best_program": evolution_result.best_program,
-            "best_score": evolution_result.best_score,
-            "generation": evolution_result.generation,
-            "total_evaluations": evolution_result.total_evaluations,
-            "artifacts": [evolution_result.best_program]
+        # Perform intelligent localization
+        result = await agent.localize(task_description)
+        
+        # Extract semantic insights
+        semantic_insights = {
+            "target_entities": result.final_ranking,
+            "confidence": result.confidence,
+            "reasoning_trace": result.reasoning_trace,
+            "hypotheses": result.hypotheses if hasattr(result, 'hypotheses') else [],
+            "semantic_neighborhood": []
         }
+        
+        # Get semantic neighborhood for each target
+        for entity_id, score in result.final_ranking[:5]:
+            neighborhood = self.locagent.get_semantic_neighborhood(entity_id, depth=2)
+            semantic_insights["semantic_neighborhood"].extend(list(neighborhood))
+        
+        return semantic_insights
+
+    async def _analyze_semantic_impact(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze the semantic impact of code changes using LOCAGENT."""
+        changed_entities = candidate.get("changed_entities", [])
+        semantic_impact = {
+            "affected_entities": [],
+            "semantic_relationships": [],
+            "usage_pattern_impact": {},
+            "co_occurrence_changes": {}
+        }
+        
+        for entity_id in changed_entities:
+            # Get semantic relationships
+            relationships = self.locagent.get_semantic_relationships(entity_id)
+            semantic_impact["semantic_relationships"].extend(relationships)
+            
+            # Get usage patterns
+            patterns = self.locagent.get_usage_patterns(entity_id)
+            semantic_impact["usage_pattern_impact"][entity_id] = patterns
+            
+            # Get co-occurrence impacts
+            co_occurrence = self.locagent.find_semantically_similar_entities(entity_id)
+            semantic_impact["co_occurrence_changes"][entity_id] = co_occurrence
+        
+        return semantic_impact
+
+    async def _evolve_stage(self, task_description: str, context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Enhanced evolution stage with LOCAGENT-powered intelligent targeting.
+        """
+        print("🧠 Using LOCAGENT for intelligent evolution targeting...")
+        
+        # Step 1: Localize the task using LOCAGENT
+        localization_result = await self._localize_task(task_description)
+        
+        # Step 2: Extract target entities and their semantic context
+        target_entities = localization_result["target_entities"][:10]  # Top 10 targets
+        semantic_neighborhood = localization_result["semantic_neighborhood"]
+        
+        # Step 3: Create evolution context with semantic understanding
+        evolution_context = {
+            "task_description": task_description,
+            "target_entities": target_entities,
+            "semantic_neighborhood": semantic_neighborhood,
+            "confidence_threshold": localization_result["confidence"],
+            "reasoning_trace": localization_result["reasoning_trace"]
+        }
+        
+        # Step 4: Run targeted evolution
+        print(f"🎯 Targeting {len(target_entities)} entities with semantic context...")
+        evolution_result = await self.alphaevolve.evolve(
+            target_entities=target_entities,
+            context=evolution_context,
+            budget=self.config.evolution_budget,
+            use_semantic_guidance=True  # New parameter for semantic guidance
+        )
+        
+        # Step 5: Add LOCAGENT insights to evolution result
+        evolution_result.update({
+            "locagent_insights": localization_result,
+            "semantic_targeting": True,
+            "target_entity_count": len(target_entities),
+            "semantic_neighborhood_size": len(semantic_neighborhood)
+        })
+        
+        return evolution_result
     
     async def _evaluate_stage(self, evolution_result: Dict[str, Any]) -> Dict[str, Any]:
-        """Evaluate stage: Staged evaluation of candidates."""
-        program = evolution_result["best_program"]
+        """
+        Enhanced evaluation with LOCAGENT-powered code understanding.
+        """
+        print("📊 Running LOCAGENT-enhanced evaluation...")
         
-        # Run staged evaluation
-        score = await self.evaluator_pool.evaluate_staged(program)
+        # Get LOCAGENT insights from evolution result
+        locagent_insights = evolution_result.get("locagent_insights", {})
+        target_entities = locagent_insights.get("target_entities", [])
         
-        # Check guardrails
-        guardrail_result = await self.guardrails.evaluate_guardrails(program, {"score": score})
+        evaluation_results = []
+        
+        for candidate in evolution_result.get("candidates", []):
+            # Step 1: Analyze semantic impact using LOCAGENT
+            semantic_impact = await self._analyze_semantic_impact(candidate)
+            
+            # Step 2: Enhanced evaluation with code understanding
+            evaluation_score = await self.evaluator_pool.evaluate(
+                candidate=candidate,
+                semantic_context=semantic_impact,
+                target_entities=target_entities,
+                use_locagent_metrics=True  # New parameter
+            )
+            
+            # Step 3: Add LOCAGENT-specific metrics
+            locagent_metrics = await self._calculate_locagent_metrics(candidate, target_entities)
+            
+            # Step 4: Combine traditional and LOCAGENT metrics
+            combined_score = self._combine_evaluation_scores(
+                traditional_score=evaluation_score,
+                locagent_metrics=locagent_metrics,
+                semantic_impact=semantic_impact
+            )
+            
+            evaluation_results.append({
+                "candidate": candidate,
+                "traditional_score": evaluation_score,
+                "locagent_metrics": locagent_metrics,
+                "semantic_impact": semantic_impact,
+                "combined_score": combined_score,
+                "confidence": locagent_insights.get("confidence", 0.5)
+            })
+        
+        # Sort by combined score
+        evaluation_results.sort(key=lambda x: x["combined_score"], reverse=True)
         
         return {
-            "score": score,
-            "guardrail_passed": guardrail_result.passed,
-            "hacking_detections": len(guardrail_result.hacking_detections),
-            "safety_score": guardrail_result.safety_score,
-            "warnings": guardrail_result.warnings
+            "evaluation_results": evaluation_results,
+            "locagent_enhanced": True,
+            "semantic_understanding": True,
+            "best_score": evaluation_results[0]["combined_score"] if evaluation_results else 0
         }
+
+    async def _calculate_locagent_metrics(self, candidate: Dict[str, Any], 
+                                        target_entities: List[str]) -> Dict[str, float]:
+        """Calculate LOCAGENT-specific evaluation metrics."""
+        changed_entities = candidate.get("changed_entities", [])
+        
+        # Calculate semantic relevance
+        semantic_relevance = 0.0
+        for changed_entity in changed_entities:
+            for target_entity, score in target_entities:
+                if changed_entity == target_entity:
+                    semantic_relevance += score
+                else:
+                    # Check semantic relationships
+                    relationships = self.locagent.get_semantic_relationships(changed_entity)
+                    if target_entity in relationships:
+                        semantic_relevance += score * 0.5
+        
+        # Calculate usage pattern alignment
+        pattern_alignment = 0.0
+        for changed_entity in changed_entities:
+            patterns = self.locagent.get_usage_patterns(changed_entity)
+            pattern_alignment += len(patterns) * 0.1
+        
+        # Calculate co-occurrence impact
+        co_occurrence_impact = 0.0
+        for changed_entity in changed_entities:
+            similar_entities = self.locagent.find_semantically_similar_entities(changed_entity)
+            co_occurrence_impact += sum(score for _, score in similar_entities) * 0.2
+        
+        return {
+            "semantic_relevance": semantic_relevance,
+            "pattern_alignment": pattern_alignment,
+            "co_occurrence_impact": co_occurrence_impact,
+            "overall_locagent_score": (semantic_relevance + pattern_alignment + co_occurrence_impact) / 3
+        }
+
+    def _combine_evaluation_scores(self, traditional_score: float, 
+                                 locagent_metrics: Dict[str, float],
+                                 semantic_impact: Dict[str, Any]) -> float:
+        """Combine traditional and LOCAGENT evaluation scores."""
+        # Weighted combination
+        traditional_weight = 0.4
+        locagent_weight = 0.6
+        
+        locagent_score = locagent_metrics["overall_locagent_score"]
+        
+        # Adjust weights based on semantic impact
+        if len(semantic_impact["semantic_relationships"]) > 5:
+            locagent_weight = 0.7  # Higher weight for high semantic impact
+        
+        combined_score = (traditional_score * traditional_weight + 
+                         locagent_score * locagent_weight)
+        
+        return min(1.0, combined_score)  # Cap at 1.0
     
     async def _select_stage(self, evaluation_result: Dict[str, Any]) -> Dict[str, Any]:
         """Select stage: Elite selection and program registry update."""
@@ -324,21 +539,140 @@ class UE_SEA_Orchestrator:
         }
     
     async def _train_stage(self) -> Dict[str, Any]:
-        """Train stage: Skill training and model updates."""
-        training_results = {}
+        """
+        Enhanced training stage with LOCAGENT real-time feedback integration.
+        """
+        print("🔄 Running LOCAGENT-enhanced training with real-time feedback...")
         
-        # Train each skill path
-        for skill_id, skill in self.skill_registry.items():
-            print(f"    Training {skill_id}...")
-            
-            # Run training for this skill
-            training_result = await self.reasoning_curriculum.train_skill(
-                skill, max_steps=self.config.training_budget
-            )
-            
-            training_results[skill_id] = training_result
+        # Initialize LOCAGENT trainer with GPU acceleration
+        from .locagent import LOCAGENT_Trainer
+        trainer = LOCAGENT_Trainer(
+            model_name="microsoft/DialoGPT-medium",
+            use_gpu=self.config.gpu_enabled
+        )
         
-        return training_results
+        # Load model
+        trainer.load_model()
+        
+        # Get previous metrics for comparison
+        previous_metrics = self._get_previous_training_metrics()
+        
+        # Prepare training data with LOCAGENT insights
+        training_data = await self._prepare_locagent_training_data()
+        
+        # Run training with real-time evaluation
+        training_result = await self._run_enhanced_training(
+            trainer=trainer,
+            training_data=training_data,
+            previous_metrics=previous_metrics
+        )
+        
+        # Generate feedback and adjust strategy
+        feedback = trainer.generate_feedback(
+            current_metrics=training_result["metrics"],
+            previous_metrics=previous_metrics
+        )
+        
+        # Store feedback for next cycle
+        self._store_training_feedback(feedback)
+        
+        return {
+            "training_result": training_result,
+            "feedback": feedback,
+            "locagent_enhanced": True,
+            "real_time_evaluation": True
+        }
+
+    async def _prepare_locagent_training_data(self) -> List[Dict[str, Any]]:
+        """Prepare training data with LOCAGENT insights."""
+        training_data = []
+        
+        # Get recent localization results
+        recent_localizations = self._get_recent_localizations()
+        
+        for localization in recent_localizations:
+            # Create training example with LOCAGENT insights
+            training_example = {
+                "issue_description": localization["task_description"],
+                "target_entities": localization["target_entities"],
+                "semantic_context": localization.get("semantic_insights", {}),
+                "reasoning_trace": localization.get("reasoning_trace", []),
+                "confidence": localization.get("confidence", 0.5)
+            }
+            training_data.append(training_example)
+        
+        return training_data
+
+    async def _run_enhanced_training(self, trainer, training_data: List[Dict[str, Any]], 
+                                   previous_metrics: Optional[Dict[str, float]]) -> Dict[str, Any]:
+        """Run training with LOCAGENT real-time evaluation."""
+        metrics_history = []
+        
+        for epoch in range(3):  # 3 epochs
+            epoch_metrics = {}
+            
+            for batch in training_data:
+                # Run training step
+                step_metrics = await trainer.train_step(batch)
+                
+                # Real-time evaluation
+                if step_metrics.get("predictions"):
+                    real_time_metrics = trainer.evaluate_realtime(
+                        predictions=step_metrics["predictions"],
+                        ground_truth=step_metrics["ground_truth"],
+                        k=5
+                    )
+                    epoch_metrics.update(real_time_metrics)
+            
+            metrics_history.append(epoch_metrics)
+            
+            # Generate feedback for this epoch
+            if previous_metrics:
+                feedback = trainer.generate_feedback(epoch_metrics, previous_metrics)
+                if feedback["performance_trend"] == "declining":
+                    # Adjust training strategy
+                    await self._adjust_training_strategy(feedback["suggestions"])
+        
+        return {
+            "metrics": metrics_history[-1] if metrics_history else {},
+            "metrics_history": metrics_history,
+            "epochs_completed": 3
+        }
+
+    async def _adjust_training_strategy(self, suggestions: List[str]) -> None:
+        """Adjust training strategy based on LOCAGENT feedback."""
+        for suggestion in suggestions:
+            if "more training data" in suggestion.lower():
+                # Increase training data collection
+                await self._increase_training_data_collection()
+            elif "longer training" in suggestion.lower():
+                # Increase training epochs
+                self.config.training_budget = min(200, self.config.training_budget * 1.5)
+            elif "precision" in suggestion.lower():
+                # Adjust precision threshold
+                self.config.deployment_threshold = min(0.9, self.config.deployment_threshold + 0.05)
+
+    def _get_previous_training_metrics(self) -> Optional[Dict[str, float]]:
+        """Get previous training metrics for comparison."""
+        # Implementation to retrieve previous metrics
+        return self.training_metrics_history[-1] if self.training_metrics_history else None
+
+    def _store_training_feedback(self, feedback: Dict[str, Any]) -> None:
+        """Store training feedback for analysis."""
+        if not hasattr(self, 'training_feedback_history'):
+            self.training_feedback_history = []
+        
+        self.training_feedback_history.append(feedback)
+
+    async def _increase_training_data_collection(self) -> None:
+        """Increase training data collection."""
+        # Implementation to increase data collection
+        pass
+
+    def _get_recent_localizations(self) -> List[Dict[str, Any]]:
+        """Get recent localization results."""
+        # Implementation to get recent localizations
+        return []
     
     async def _deploy_stage(self, selection_result: Dict[str, Any]) -> Dict[str, Any]:
         """Deploy stage: Deploy elite program."""

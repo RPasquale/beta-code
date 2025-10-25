@@ -370,6 +370,63 @@ class StagedEvaluator:
         
         print(f"    Final score: {composite_score:.3f}")
         return composite_score
+
+    async def evaluate(self, candidate: Dict[str, Any], semantic_context: Dict[str, Any] = None,
+                      target_entities: List[str] = None, use_locagent_metrics: bool = False) -> float:
+        """
+        Enhanced evaluation with LOCAGENT metrics support.
+        
+        Args:
+            candidate: Evolution candidate to evaluate
+            semantic_context: LOCAGENT semantic context
+            target_entities: Target entities from LOCAGENT
+            use_locagent_metrics: Whether to use LOCAGENT-specific metrics
+        
+        Returns:
+            Evaluation score
+        """
+        if use_locagent_metrics and semantic_context:
+            # Use LOCAGENT-enhanced evaluation
+            return await self._evaluate_with_locagent_metrics(
+                candidate, semantic_context, target_entities
+            )
+        else:
+            # Standard evaluation
+            code = candidate.get("changes", "")
+            return await self.evaluate_staged(code)
+
+    async def _evaluate_with_locagent_metrics(self, candidate: Dict[str, Any],
+                                            semantic_context: Dict[str, Any],
+                                            target_entities: List[str]) -> float:
+        """Evaluate with LOCAGENT-specific metrics."""
+        # Get base evaluation score
+        code = candidate.get("changes", "")
+        base_score = await self.evaluate_staged(code)
+        
+        # Calculate LOCAGENT enhancement
+        locagent_enhancement = 0.0
+        
+        if semantic_context:
+            # Semantic relationship bonus
+            relationships = semantic_context.get("semantic_relationships", [])
+            if relationships:
+                locagent_enhancement += min(0.2, len(relationships) * 0.05)
+            
+            # Usage pattern bonus
+            usage_patterns = semantic_context.get("usage_pattern_impact", {})
+            if usage_patterns:
+                pattern_count = sum(len(patterns) for patterns in usage_patterns.values())
+                locagent_enhancement += min(0.2, pattern_count * 0.02)
+            
+            # Co-occurrence bonus
+            co_occurrence = semantic_context.get("co_occurrence_changes", {})
+            if co_occurrence:
+                co_occurrence_count = sum(len(entities) for entities in co_occurrence.values())
+                locagent_enhancement += min(0.1, co_occurrence_count * 0.01)
+        
+        # Combine scores
+        enhanced_score = base_score + locagent_enhancement
+        return min(1.0, enhanced_score)  # Cap at 1.0
     
     async def _full_evaluation(self, code: str) -> EvaluationResult:
         """Full evaluation stage."""

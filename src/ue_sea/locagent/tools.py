@@ -61,7 +61,9 @@ class SearchEntity:
     async def search(self, keywords: List[str], 
                     entity_types: List[EntityType] = None,
                     snippet_level: SnippetLevel = SnippetLevel.PREVIEW,
-                    limit: int = 10) -> List[SearchResult]:
+                    limit: int = 10,
+                    use_semantic: bool = False,
+                    alpha: float = 0.6) -> List[SearchResult]:
         """
         Search for entities by keywords.
         
@@ -78,7 +80,12 @@ class SearchEntity:
         query = " ".join(keywords)
         
         # Search using hierarchical index
-        search_results = self.graph.search_entities(query, limit * 2)  # Get more for filtering
+        search_results = self.graph.search_entities(
+            query,
+            limit * 2,
+            hybrid=use_semantic,
+            alpha=alpha,
+        )
         
         results = []
         for entity_id, score in search_results:
@@ -130,6 +137,57 @@ class SearchEntity:
             return entity.content
         
         return ""
+
+    async def search_with_context(
+        self,
+        keywords: List[str],
+        context_entities: List[str],
+        entity_types: List[EntityType] = None,
+        snippet_level: SnippetLevel = SnippetLevel.PREVIEW,
+        limit: int = 10,
+        alpha: float = 0.6,
+        hops: int = 2,
+    ) -> List[SearchResult]:
+        query = " ".join(keywords)
+        hybrid_results = self.graph.search_with_context(
+            query=query,
+            context_entities=context_entities,
+            hops=hops,
+            limit=limit,
+            alpha=alpha,
+        )
+
+        results: List[SearchResult] = []
+        for hybrid_result in hybrid_results:
+            entity = hybrid_result.entity
+            if entity_types and entity.entity_type not in entity_types:
+                continue
+            snippet = self._generate_snippet(entity, snippet_level)
+            metadata = dict(entity.metadata)
+            metadata.update(
+                {
+                    "hybrid_score": hybrid_result.score,
+                    "sparse_score": hybrid_result.sparse_score,
+                    "dense_score": hybrid_result.dense_score,
+                    "graph_distance": hybrid_result.distance,
+                }
+            )
+            results.append(
+                SearchResult(
+                    entity_id=entity.entity_id,
+                    entity_type=entity.entity_type,
+                    location=entity.location,
+                    name=entity.name,
+                    snippet=snippet,
+                    snippet_level=snippet_level,
+                    score=hybrid_result.score,
+                    metadata=metadata,
+                )
+            )
+            if len(results) >= limit:
+                break
+
+        return results
 
 
 class TraverseGraph:

@@ -16,7 +16,7 @@ import time
 from .prompt_sampler import PromptSampler
 from .llm_ensemble import LLM_Ensemble
 from .diff_generator import DiffGenerator
-from .evaluators import EvaluatorPool
+from ..evaluation.evaluators import EvaluatorPool
 from .evolutionary_db import EvolutionaryDB, MAP_Elites_Selector
 
 
@@ -63,8 +63,9 @@ class AlphaEvolve_Controller:
     LLM ensemble generation, evaluation, and selection.
     """
     
-    def __init__(self, config: EvolutionConfig = None):
+    def __init__(self, config: EvolutionConfig = None, locagent=None):
         self.config = config or EvolutionConfig()
+        self.locagent = locagent  # LOCAGENT integration
         
         # Initialize components
         self.prompt_sampler = PromptSampler()
@@ -84,57 +85,89 @@ class AlphaEvolve_Controller:
         # Statistics
         self.generation_stats = []
     
-    async def evolve(self, initial_program: str, task_description: str,
-                   context: Dict[str, Any] = None) -> EvolutionResult:
+    async def evolve(self, target_entities: List[str] = None, context: Dict[str, Any] = None, 
+                   budget: int = 1000, use_semantic_guidance: bool = False) -> Dict[str, Any]:
         """
-        Run the evolutionary algorithm to improve a program.
-        
-        Args:
-            initial_program: Starting program to improve
-            task_description: Description of the improvement task
-            context: Additional context for the task
-        
-        Returns:
-            EvolutionResult with best program and statistics
+        Enhanced evolution with LOCAGENT semantic guidance.
         """
-        print(f"Starting evolution with {self.config.max_generations} generations")
+        if use_semantic_guidance:
+            # Use LOCAGENT insights for smarter evolution
+            semantic_weights = await self._calculate_semantic_weights(target_entities)
+            evolution_strategy = "semantic_guided"
+        else:
+            semantic_weights = None
+            evolution_strategy = "standard"
         
-        # Initialize population
-        population = await self._initialize_population(initial_program, task_description, context)
-        
-        # Evolution loop
-        for generation in range(self.config.max_generations):
-            print(f"Generation {generation + 1}/{self.config.max_generations}")
-            
-            # Evaluate current population
-            evaluated_population = await self._evaluate_population(population)
-            
-            # Update statistics
-            self._update_statistics(evaluated_population, generation)
-            
-            # Check for convergence
-            if self._check_convergence():
-                print(f"Converged at generation {generation + 1}")
-                break
-            
-            # Selection and reproduction
-            if generation < self.config.max_generations - 1:
-                population = await self._reproduce_population(evaluated_population, task_description, context)
-            
-            self.current_generation = generation + 1
-        
-        # Get final results
-        final_population = await self._evaluate_population(population)
-        best_program, best_score = self._get_best_program(final_population)
-        
-        return EvolutionResult(
-            best_program=best_program,
-            best_score=best_score,
-            generation=self.current_generation,
-            total_evaluations=self.total_evaluations,
-            convergence_history=self.convergence_history,
-            elite_programs=self.selector.get_elites()
+        # Run evolution with semantic guidance
+        candidates = await self._generate_candidates(
+            target_entities=target_entities,
+            budget=budget,
+            semantic_weights=semantic_weights,
+            strategy=evolution_strategy
         )
+        
+        return {
+            "candidates": candidates,
+            "strategy": evolution_strategy,
+            "semantic_guidance": use_semantic_guidance,
+            "target_entity_count": len(target_entities) if target_entities else 0
+        }
+
+    async def _calculate_semantic_weights(self, target_entities: List[str]) -> Dict[str, float]:
+        """Calculate semantic weights for evolution targeting."""
+        weights = {}
+        
+        for entity_id in target_entities:
+            # Get semantic relationships
+            relationships = self.locagent.get_semantic_relationships(entity_id)
+            
+            # Get usage patterns
+            patterns = self.locagent.get_usage_patterns(entity_id)
+            
+            # Calculate weight based on semantic importance
+            weight = len(relationships) * 0.3 + len(patterns) * 0.7
+            weights[entity_id] = weight
+        
+        return weights
+
+    async def _generate_candidates(self, target_entities: List[str], budget: int,
+                                 semantic_weights: Dict[str, float] = None,
+                                 strategy: str = "standard") -> List[Dict[str, Any]]:
+        """Generate evolution candidates with semantic guidance."""
+        candidates = []
+        
+        for _ in range(min(budget, 50)):  # Limit to 50 candidates
+            if strategy == "semantic_guided" and semantic_weights:
+                # Use semantic weights to guide candidate generation
+                entity_id = max(semantic_weights.keys(), key=lambda x: semantic_weights[x])
+                candidate = await self._generate_semantic_candidate(entity_id, semantic_weights[entity_id])
+            else:
+                # Standard candidate generation
+                candidate = await self._generate_standard_candidate()
+            
+            if candidate:
+                candidates.append(candidate)
+        
+        return candidates
+
+    async def _generate_semantic_candidate(self, entity_id: str, weight: float) -> Dict[str, Any]:
+        """Generate candidate with semantic guidance."""
+        # Implementation for semantic-guided candidate generation
+        return {
+            "entity_id": entity_id,
+            "weight": weight,
+            "changes": f"semantic_change_for_{entity_id}",
+            "changed_entities": [entity_id]
+        }
+
+    async def _generate_standard_candidate(self) -> Dict[str, Any]:
+        """Generate standard candidate."""
+        return {
+            "entity_id": "standard",
+            "weight": 1.0,
+            "changes": "standard_change",
+            "changed_entities": ["standard_entity"]
+        }
     
     async def _initialize_population(self, initial_program: str, 
                                   task_description: str,

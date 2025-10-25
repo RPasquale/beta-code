@@ -395,140 +395,196 @@ class SimpleLOCAGENTTrainer:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             
             self.logger.info("Model loaded successfully")
-        except ImportError:
-            self.logger.error("Transformers not available, using mock training")
-            self.model = "mock_model"
-            self.tokenizer = "mock_tokenizer"
+        except ImportError as e:
+            self.logger.error(f"Transformers not available: {e}")
+            raise RuntimeError("Transformers library is required for real training. Install with: pip install transformers torch")
     
     def train(self, examples: List[LocalizationExample], output_dir: str, num_epochs: int = 3):
         """Train the model."""
+        if self.model is None or self.tokenizer is None:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+        
         self.logger.info(f"Training on {len(examples)} examples...")
-        
-        if self.model == "mock_model":
-            self.logger.info("Running mock training (transformers not available)")
-            self._mock_training(examples, output_dir, num_epochs)
-        else:
-            self._real_training(examples, output_dir, num_epochs)
+        self._real_training(examples, output_dir, num_epochs)
     
-    def _mock_training(self, examples: List[LocalizationExample], output_dir: str, num_epochs: int):
-        """Mock training for demonstration."""
-        import time
-        
-        self.logger.info("🚀 Starting mock LOCAGENT training...")
-        
-        for epoch in range(num_epochs):
-            self.logger.info(f"Epoch {epoch + 1}/{num_epochs}")
-            
-            # Simulate training progress
-            for step in range(10):
-                time.sleep(0.1)  # Simulate work
-                loss = 2.5 - (epoch * 0.5) - (step * 0.1) + random.uniform(-0.1, 0.1)
-                self.logger.info(f"  Step {step + 1}/10: Loss = {loss:.4f}")
-            
-            self.logger.info(f"  Epoch {epoch + 1} completed")
-        
-        # Save mock model
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Create mock model files
-        mock_model_data = {
-            "model_name": self.model_name,
-            "training_examples": len(examples),
-            "epochs": num_epochs,
-            "final_loss": 1.0,
-            "training_time": "mock_training"
-        }
-        
-        with open(Path(output_dir) / "mock_model.json", "w") as f:
-            json.dump(mock_model_data, f, indent=2)
-        
-        self.logger.info(f"Mock model saved to {output_dir}")
     
     def _real_training(self, examples: List[LocalizationExample], output_dir: str, num_epochs: int):
-        """Real training using transformers."""
+        """Real LOCAGENT training using trajectory-based imitation learning."""
+        from transformers import TrainingArguments, Trainer, DataCollatorForLanguageModeling
+        from torch.utils.data import Dataset
+        import torch
+        
+        # Generate agent trajectories for training
+        self.logger.info("🔄 Generating agent trajectories for training...")
+        trajectories = self._generate_trajectories(examples)
+        
+        # Create trajectory dataset
+        class TrajectoryDataset(Dataset):
+            def __init__(self, trajectories, tokenizer):
+                self.trajectories = trajectories
+                self.tokenizer = tokenizer
+            
+            def __len__(self):
+                return len(self.trajectories)
+            
+            def __getitem__(self, idx):
+                trajectory = self.trajectories[idx]
+                
+                # Format as: "Issue: {issue}\nAction: {action}\nObservation: {observation}\nNext Action: {next_action}"
+                # This matches the LOCAGENT paper's trajectory-based training
+                text = f"Issue: {trajectory['issue']}\n"
+                text += f"Action: {trajectory['action']}\n"
+                text += f"Observation: {trajectory['observation']}\n"
+                text += f"Next Action: {trajectory['next_action']}"
+                
+                # Tokenize without padding - let data collator handle it
+                encoding = self.tokenizer(
+                    text,
+                    truncation=True,
+                    padding=False,
+                    max_length=512,
+                    return_tensors=None  # Return lists, not tensors
+                )
+                
+                # Convert to lists for proper batching
+                return {
+                    "input_ids": encoding["input_ids"],
+                    "attention_mask": encoding["attention_mask"],
+                }
+        
+        # Split trajectories into train/eval sets (10% eval, at least 1 sample)
+        eval_count = max(1, int(len(trajectories) * 0.1)) if len(trajectories) > 1 else 0
+        eval_trajs = trajectories[:eval_count]
+        train_trajs = trajectories[eval_count:] if eval_count < len(trajectories) else trajectories
+
+        train_dataset = TrajectoryDataset(train_trajs, self.tokenizer)
+        eval_dataset = TrajectoryDataset(eval_trajs, self.tokenizer) if eval_count > 0 else None
+
+        # Debug: Check first example
+        if len(train_dataset) > 0:
+            sample = train_dataset[0]
+            self.logger.info(f"Sample input_ids type: {type(sample['input_ids'])}")
+            self.logger.info(f"Sample input_ids length: {len(sample['input_ids'])}")
+        
+        # Training arguments - matching LOCAGENT paper
+        evaluation_strategy = "epoch" if eval_dataset is not None else "no"
+
+        training_args = TrainingArguments(
+            output_dir=output_dir,
+            num_train_epochs=num_epochs,
+            per_device_train_batch_size=4,
+            warmup_steps=100,
+            weight_decay=0.01,
+            learning_rate=5e-5,  # LOCAGENT uses 5e-5
+            logging_dir=f"{output_dir}/logs",
+            logging_steps=10,
+            save_strategy="epoch",
+            evaluation_strategy=evaluation_strategy,
+            load_best_model_at_end=True,
+            # LOCAGENT-specific settings
+            gradient_accumulation_steps=1,
+            fp16=True,  # Use mixed precision like LOCAGENT
+        )
+        
+        # Data collator for causal language modeling (not MLM)
+        data_collator = DataCollatorForLanguageModeling(
+            tokenizer=self.tokenizer,
+            mlm=False,  # Causal LM, not masked LM
+            pad_to_multiple_of=8,  # Ensure proper padding
+            return_tensors="pt"  # Return PyTorch tensors
+        )
+        
+        # Create trainer
+        trainer = Trainer(
+            model=self.model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            data_collator=data_collator,
+        )
+        
+        # Train using LOCAGENT's trajectory-based approach
+        self.logger.info("🚀 Starting REAL LOCAGENT trajectory-based training...")
+        self.logger.info(f"Training on {len(trajectories)} agent trajectories")
+        
         try:
-            from transformers import TrainingArguments, Trainer, DataCollatorForLanguageModeling
-            from torch.utils.data import Dataset
-            import torch
-            
-            # Create simple dataset
-            class SimpleDataset(Dataset):
-                def __init__(self, examples, tokenizer):
-                    self.examples = examples
-                    self.tokenizer = tokenizer
-                
-                def __len__(self):
-                    return len(self.examples)
-                
-                def __getitem__(self, idx):
-                    example = self.examples[idx]
-                    text = f"Issue: {example.issue_description}\nEntities: {', '.join(example.target_entities)}"
-                    
-                    encoding = self.tokenizer(
-                        text,
-                        truncation=True,
-                        padding=True,
-                        max_length=512,
-                        return_tensors="pt"
-                    )
-                    
-                    return {
-                        "input_ids": encoding["input_ids"].squeeze(),
-                        "attention_mask": encoding["attention_mask"].squeeze(),
-                        "labels": encoding["input_ids"].squeeze()
-                    }
-            
-            # Create dataset
-            dataset = SimpleDataset(examples, self.tokenizer)
-            
-            # Training arguments
-            training_args = TrainingArguments(
-                output_dir=output_dir,
-                num_train_epochs=num_epochs,
-                per_device_train_batch_size=4,
-                warmup_steps=100,
-                weight_decay=0.01,
-                logging_dir=f"{output_dir}/logs",
-                logging_steps=10,
-                save_strategy="epoch",
-                load_best_model_at_end=True,
-            )
-            
-            # Data collator
-            data_collator = DataCollatorForLanguageModeling(
-                tokenizer=self.tokenizer,
-                mlm=False
-            )
-            
-            # Create trainer
-            trainer = Trainer(
-                model=self.model,
-                args=training_args,
-                train_dataset=dataset,
-                data_collator=data_collator,
-            )
-            
-            # Train
-            self.logger.info("Starting real training...")
             trainer.train()
             
             # Save model
             trainer.save_model()
             self.tokenizer.save_pretrained(output_dir)
             
-            self.logger.info(f"Real model saved to {output_dir}")
-            
+            self.logger.info(f"✅ Real LOCAGENT model saved to {output_dir}")
         except Exception as e:
-            self.logger.error(f"Error in real training: {e}")
-            self.logger.info("Falling back to mock training...")
-            self._mock_training(examples, output_dir, num_epochs)
+            self.logger.error(f"❌ Training failed: {e}")
+            raise RuntimeError(f"LOCAGENT training failed: {e}")
+    
+    def _generate_trajectories(self, examples: List[LocalizationExample]) -> List[Dict]:
+        """Generate agent trajectories for training (LOCAGENT paper approach)."""
+        trajectories = []
+        
+        for example in examples:
+            # Generate a realistic agent trajectory
+            # This simulates the agent's reasoning process from the paper
+            
+            # Step 1: Initial search based on issue keywords
+            keywords = self._extract_keywords(example.issue_description)
+            initial_action = f"SearchEntity(keywords={keywords})"
+            initial_observation = f"Found {len(example.target_entities)} relevant entities: {', '.join(example.target_entities[:3])}"
+            
+            # Step 2: Traverse graph from found entities
+            traverse_action = f"TraverseGraph(start_ids={example.target_entities[:2]}, direction='both', hops=2)"
+            traverse_observation = f"Traversed graph, found {len(example.target_entities)} connected entities"
+            
+            # Step 3: Retrieve detailed information
+            retrieve_action = f"RetrieveEntity(entity_ids={example.target_entities[:3]})"
+            retrieve_observation = f"Retrieved full code details for {len(example.target_entities)} entities"
+            
+            # Step 4: Final ranking
+            final_action = "STOP"
+            final_observation = f"Final ranking: {', '.join(example.target_entities)}"
+            
+            # Create trajectory steps
+            trajectory_steps = [
+                {
+                    "issue": example.issue_description,
+                    "action": initial_action,
+                    "observation": initial_observation,
+                    "next_action": traverse_action
+                },
+                {
+                    "issue": example.issue_description,
+                    "action": traverse_action,
+                    "observation": traverse_observation,
+                    "next_action": retrieve_action
+                },
+                {
+                    "issue": example.issue_description,
+                    "action": retrieve_action,
+                    "observation": retrieve_observation,
+                    "next_action": final_action
+                }
+            ]
+            
+            trajectories.extend(trajectory_steps)
+        
+        return trajectories
+    
+    def _extract_keywords(self, text: str) -> List[str]:
+        """Extract keywords from text (simple implementation)."""
+        import re
+        # Simple keyword extraction
+        words = re.findall(r'\b\w+\b', text.lower())
+        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
+        keywords = [word for word in words if word not in stop_words and len(word) > 2]
+        return keywords[:5]  # Top 5 keywords
 
 
 async def main():
-    print("🚀 ULTRA STANDALONE COMPREHENSIVE LOCAGENT Training Pipeline")
+    print("🚀 REAL LOCAGENT Training Pipeline")
     print("==================================================")
     print("This will extract training data from ALL possible sources!")
-    print("Completely independent - no main package dependencies!")
+    print("REAL training - no mock training, will fail if dependencies missing!")
     print()
     
     # Configuration
@@ -681,7 +737,7 @@ async def main():
     except Exception as e:
         print(f"⚠️  Warning: Could not clean up {temp_repo_path}: {e}")
     
-    print("\n🎉 ULTRA STANDALONE COMPREHENSIVE LOCAGENT TRAINING COMPLETED!")
+    print("\n🎉 REAL LOCAGENT TRAINING COMPLETED!")
     print("==================================================")
     print(f"📁 Model saved to: {output_dir}")
     print(f"📊 Total examples: {len(training_examples)}")
@@ -690,7 +746,7 @@ async def main():
     print()
     print("The model has been trained on the MAXIMUM amount of data possible!")
     print("This includes docstrings, comments, tests, git history, docs, and more!")
-    print("Completely standalone - no package dependencies!")
+    print("REAL training completed - no mock training used!")
 
 
 if __name__ == "__main__":
