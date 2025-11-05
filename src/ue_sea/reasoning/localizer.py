@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 
 
 try:  # Optional import – LOCAGENT may not be available in minimal setups
-    from ..locagent import LOCAGENT_Graph, HybridSearchResult
+    from ..locagent.graph import LOCAGENT_Graph
+    from ..locagent.graph import HybridSearchResult
 except Exception:  # pragma: no cover - fallback if optional deps missing
     LOCAGENT_Graph = None  # type: ignore
     HybridSearchResult = None  # type: ignore

@@ -22,12 +22,14 @@ Override any argument from the CLI; run `python train.py --help` for details.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
 import random
 import math
 import subprocess
+import sys
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass
@@ -60,7 +62,13 @@ LOGGER = logging.getLogger("ue_sea.train")
 
 # Relative paths are resolved from the repository / training directory.
 SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = SCRIPT_DIR.parent
+SRC_DIR = ROOT_DIR / "src"
+if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 DATA_DIR = SCRIPT_DIR / "data"
+
+from ue_sea.orchestrator import UE_SEA_Orchestrator, CycleConfig
 
 
 DEFAULT_OBJECTIVE_ORDER = ["core", "evolutionary", "alpha_code", "reasoning", "rl"]
@@ -143,6 +151,45 @@ def parse_args() -> "TrainingConfig":
         type=float,
         default=0.0,
         help="Optional entropy floor reference used for monitoring in RL stage.",
+    )
+    parser.add_argument(
+        "--run-spct",
+        action="store_true",
+        help="Run SPCT (Self-Principled Critique Tuning) after supervised training.",
+    )
+    parser.add_argument(
+        "--run-rl",
+        action="store_true",
+        help="Run Dr.GRPO RL pipeline after supervised training.",
+    )
+    parser.add_argument(
+        "--full-agent",
+        action="store_true",
+        help="Run supervised fine-tuning, SPCT, and RL sequentially.",
+    )
+    parser.add_argument(
+        "--spct-training-data",
+        type=str,
+        default=None,
+        help="JSONL file containing SPCT training data.",
+    )
+    parser.add_argument(
+        "--rl-training-data",
+        type=str,
+        default=None,
+        help="JSONL file containing RL training data.",
+    )
+    parser.add_argument(
+        "--spct-config-json",
+        type=str,
+        default=None,
+        help="Optional path to a JSON file overriding SPCT configuration.",
+    )
+    parser.add_argument(
+        "--rl-config-json",
+        type=str,
+        default=None,
+        help="Optional path to a JSON file overriding Dr.GRPO configuration.",
     )
     parser.add_argument(
         "--max-length",
@@ -238,6 +285,28 @@ def parse_args() -> "TrainingConfig":
     if args.eval_max_samples_per_objective is not None and args.eval_max_samples_per_objective <= 0:
         parser.error("--eval-max-samples-per-objective must be a positive integer.")
 
+    run_spct = args.run_spct or args.full_agent
+    run_rl = args.run_rl or args.full_agent
+
+    if run_spct and args.spct_training_data is None:
+        parser.error("--spct-training-data is required when --run-spct or --full-agent is set.")
+    if run_rl:
+        if args.rl_training_data is None:
+            if args.spct_training_data is not None:
+                args.rl_training_data = args.spct_training_data
+            else:
+                parser.error("--rl-training-data is required when --run-rl or --full-agent is set.")
+
+    if args.spct_training_data is not None and not Path(args.spct_training_data).exists():
+        parser.error(f"SPCT training data not found: {args.spct_training_data}")
+    if args.rl_training_data is not None and not Path(args.rl_training_data).exists():
+        parser.error(f"RL training data not found: {args.rl_training_data}")
+
+    if args.spct_config_json is not None and not Path(args.spct_config_json).exists():
+        parser.error(f"SPCT config file not found: {args.spct_config_json}")
+    if args.rl_config_json is not None and not Path(args.rl_config_json).exists():
+        parser.error(f"RL config file not found: {args.rl_config_json}")
+
     objectives: List[str] = []
     for name in args.objectives:
         if name not in objectives:
@@ -270,6 +339,13 @@ def parse_args() -> "TrainingConfig":
         kl_beta=args.kl_beta,
         reward_clip=args.reward_clip,
         entropy_floor=args.entropy_floor,
+        run_spct=run_spct,
+        run_rl=run_rl,
+        full_agent=args.full_agent,
+        spct_training_data=args.spct_training_data,
+        rl_training_data=args.rl_training_data,
+        spct_config_json=args.spct_config_json,
+        rl_config_json=args.rl_config_json,
     )
 
 
@@ -303,6 +379,13 @@ class TrainingConfig:
     kl_beta: float
     reward_clip: float
     entropy_floor: float
+    run_spct: bool
+    run_rl: bool
+    full_agent: bool
+    spct_training_data: Optional[str]
+    rl_training_data: Optional[str]
+    spct_config_json: Optional[str]
+    rl_config_json: Optional[str]
 
     def to_serializable_dict(self) -> Dict[str, Any]:
         """Return a JSON-serializable version of the config."""
@@ -735,6 +818,47 @@ FORMATTERS = {
 }
 
 
+def synthesize_alpha_code_samples(count: int = 16) -> List[Dict[str, Any]]:
+    """Create fallback AlphaCode-style samples when no data is available."""
+    samples: List[Dict[str, Any]] = []
+    base_source = (
+        "def transform(items):\n"
+        "    result = []\n"
+        "    for value in items:\n"
+        "        result.append(value)\n"
+        "    return result\n"
+    )
+    improved_target = (
+        "def transform(items):\n"
+        "    return [value for value in items if value is not None]\n"
+    )
+
+    for idx in range(count):
+        samples.append(
+            {
+                "instruction": f"Improve the data transformation utility (variant {idx}).",
+                "demonstration": [
+                    {
+                        "call": "mutate_code",
+                        "args": {"strategy": "list-comprehension", "variant": idx},
+                        "obs": {"before": base_source, "after": improved_target},
+                    }
+                ],
+                "target": {
+                    "entities": [
+                        {
+                            "path": f"module_{idx}.py",
+                            "diff": "@@ -1,6 +1,3 @@\n-    result = []\n-    for value in items:\n-        result.append(value)\n-    return result\n+    return [value for value in items if value is not None]\n",
+                        }
+                    ],
+                    "final_entity_ids": [f"module_{idx}", f"transform_{idx}"],
+                },
+            }
+        )
+
+    return samples
+
+
 def build_objective_examples(
     *,
     objective_order: List[str],
@@ -748,6 +872,25 @@ def build_objective_examples(
         available_paths = [path for path in OBJECTIVE_SOURCES[objective] if path.exists()]
 
         if not available_paths:
+            if objective == "alpha_code":
+                LOGGER.warning("No alpha_code data found; synthesizing fallback tasks.")
+                synthetic_records = synthesize_alpha_code_samples()
+                for record in synthetic_records:
+                    formatted = formatter(record)
+                    if formatted is None:
+                        continue
+                    prompt, target = formatted
+                    grouped_examples[objective].append(
+                        {
+                            "prompt": prompt,
+                            "response": target,
+                            "objective": objective,
+                            "objective_id": objective_index[objective],
+                            "reward": 1.0,
+                            "accept_mask": True,
+                        }
+                    )
+                continue
             LOGGER.warning(
                 "No data found for objective '%s'. Expected one of: %s",
                 objective,
@@ -1142,6 +1285,74 @@ def main() -> None:
         summary = metrics_tracker.summary()
         if eval_results is not None:
             summary["evaluation"] = eval_results
+
+        agent_results: Dict[str, Any] = {}
+        if config.run_spct or config.run_rl:
+            try:
+                cycle_config = CycleConfig(
+                    gpu_enabled=torch.cuda.is_available(),
+                    spct_enabled=True,
+                    spct_frequency=1,
+                )
+                orchestrator = UE_SEA_Orchestrator(config=cycle_config)
+
+                if config.full_agent:
+                    LOGGER.info("Running unified SPCT + Dr.GRPO training pipeline")
+                    spct_overrides = None
+                    rl_overrides = None
+                    if config.spct_config_json:
+                        with open(config.spct_config_json, "r", encoding="utf-8") as handle:
+                            spct_overrides = json.load(handle)
+                    if config.rl_config_json:
+                        with open(config.rl_config_json, "r", encoding="utf-8") as handle:
+                            rl_overrides = json.load(handle)
+
+                    combined_results = asyncio.run(
+                        orchestrator.train_full_agent(
+                            spct_training_data_path=config.spct_training_data,
+                            rl_training_data_path=config.rl_training_data,
+                            spct_config=spct_overrides,
+                            rl_config=rl_overrides,
+                        )
+                    )
+                    agent_results.update(combined_results)
+                else:
+                    if config.run_spct:
+                        LOGGER.info("Running SPCT pipeline via UE_SEA orchestrator")
+                        spct_overrides = None
+                        if config.spct_config_json:
+                            with open(config.spct_config_json, "r", encoding="utf-8") as handle:
+                                spct_overrides = json.load(handle)
+                        spct_results = asyncio.run(
+                            orchestrator.train_spct(
+                                config.spct_training_data,
+                                spct_overrides,
+                            )
+                        )
+                        agent_results["spct_results"] = spct_results
+
+                    if config.run_rl:
+                        LOGGER.info("Running Dr.GRPO RL pipeline via UE_SEA orchestrator")
+                        rl_overrides = None
+                        if config.rl_config_json:
+                            with open(config.rl_config_json, "r", encoding="utf-8") as handle:
+                                rl_overrides = json.load(handle)
+                        rl_results = asyncio.run(
+                            orchestrator.train_end_to_end_rl(
+                                config.rl_training_data,
+                                rl_overrides,
+                                reward_fn=None,
+                            )
+                        )
+                        agent_results["rl_results"] = rl_results
+
+            except Exception as exc:
+                LOGGER.exception("Full-agent pipeline execution failed: %s", exc)
+                agent_results.setdefault("errors", []).append(str(exc))
+
+        if agent_results:
+            summary["agent"] = agent_results
+
         LOGGER.info("Training summary: %s", summary)
         if wandb_run:
             wandb_run.log({"training/total_time_seconds": summary["total_time_seconds"]})

@@ -29,12 +29,15 @@ except ImportError:
     CUPY_AVAILABLE = False
     cp = None
 
+# Initialize sentence transformers availability
+SENTENCE_TRANSFORMERS_AVAILABLE = False
+SentenceTransformer = None
+
 try:
     from sentence_transformers import SentenceTransformer
     SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
-    SENTENCE_TRANSFORMERS_AVAILABLE = False
-    SentenceTransformer = None
+    pass
 
 from .entities import Entity, EntityType
 from .indices import BM25Index

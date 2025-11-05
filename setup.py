@@ -12,8 +12,18 @@ def read_readme():
 
 # Read requirements
 def read_requirements():
+    requirements = []
     with open("requirements.txt", "r", encoding="utf-8") as fh:
-        return [line.strip() for line in fh if line.strip() and not line.startswith("#")]
+        for line in fh:
+            line = line.strip()
+            # Skip empty lines, comments, and pip options (like --extra-index-url, --index-url)
+            if not line or line.startswith("#") or line.startswith("--"):
+                continue
+            # Only include lines that look like package requirements
+            # (contain at least one letter/digit, not just special chars)
+            if any(c.isalnum() for c in line):
+                requirements.append(line)
+    return requirements
 
 setup(
     name="ue-sea",

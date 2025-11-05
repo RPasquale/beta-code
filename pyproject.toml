@@ -73,3 +73,9 @@ markers = [
     "integration: marks tests as integration tests",
     "unit: marks tests as unit tests",
 ]
+
+[tool.uv.workspace]
+members = [
+    "koder",
+    "WM",
+]

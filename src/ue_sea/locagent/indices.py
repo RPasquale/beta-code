@@ -30,11 +30,15 @@ except ImportError:  # pragma: no cover - optional dependency
     CUPY_AVAILABLE = False
     cp = None
 
+# Initialize sentence transformers availability
+SENTENCE_TRANSFORMERS_AVAILABLE = False
+SentenceTransformer = None
+
 try:
     from sentence_transformers import SentenceTransformer
     SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:  # pragma: no cover - optional dependency
-    SentenceTransformer = None
+    pass
 
 try:
     import torch
@@ -42,7 +46,6 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     TORCH_AVAILABLE = False
     torch = None
-    SENTENCE_TRANSFORMERS_AVAILABLE = False
 
 from .entities import Entity, EntityType
 
